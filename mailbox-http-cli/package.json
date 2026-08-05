@@ -1,0 +1,16 @@
+{
+  "name": "mailbox-http-cli",
+  "version": "0.1.0",
+  "description": "Expose an HTTP mailbox API through a small JSON CLI contract",
+  "type": "module",
+  "bin": {
+    "mailbox-http": "bin/mailbox-http.mjs"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

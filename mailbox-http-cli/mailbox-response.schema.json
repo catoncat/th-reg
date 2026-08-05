@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/catoncat/aihub-register/blob/main/mailbox-http-cli/mailbox-response.schema.json",
+  "title": "Mailbox CLI message list",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["items"],
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "received_at": { "type": ["string", "null"], "format": "date-time" },
+          "text_body": { "type": ["string", "null"] },
+          "html_body": { "type": ["string", "null"] },
+          "subject": { "type": ["string", "null"] },
+          "from": { "type": ["string", "null"] },
+          "to": { "type": ["string", "null"] }
+        }
+      }
+    }
+  }
+}
