@@ -74,11 +74,17 @@ export class Browser {
     }
   }
 
-  /** Wait until location.href matches a pattern, or timeout. */
-  async waitForUrl(regex, { timeoutMs = 40000 } = {}) {
+  /** Wait until location.href matches a pattern, or timeout. Tolerates
+   *  transient eval failures (page still navigating). */
+  async waitForUrl(regex, { timeoutMs = 60000 } = {}) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      const st = await this.state();
+      let st = null;
+      try {
+        st = await this.state();
+      } catch {
+        /* ignore transient eval errors and keep polling */
+      }
       if (st && typeof st === 'object' && regex.test(st.url || '')) return st;
       await sleep(1500);
     }
@@ -95,5 +101,14 @@ export class Browser {
       }
     }
     return st;
+  }
+
+  /** Close this session's browser. Best-effort; never throws. */
+  async close() {
+    try {
+      await this.run(['close'], { timeoutMs: 15000 });
+    } catch {
+      /* already closed */
+    }
   }
 }

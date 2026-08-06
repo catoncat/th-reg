@@ -20,7 +20,7 @@ import { sleep } from './mailbox.mjs';
 const execFileAsync = promisify(execFile);
 
 function parseArgs(argv) {
-  const o = { count: undefined, domain: undefined, delayMs: undefined, workers: undefined, noVerify: false };
+  const o = { count: undefined, domain: undefined, delayMs: undefined, workers: undefined, inviteCode: undefined, noVerify: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const next = () => argv[++i];
@@ -28,8 +28,9 @@ function parseArgs(argv) {
     else if (a === '--domain') o.domain = next().replace(/^@/, '');
     else if (a === '--delay-ms') o.delayMs = Number(next());
     else if (a === '--workers') o.workers = Number(next());
+    else if (a === '--invite-code') o.inviteCode = next();
     else if (a === '--no-verify') o.noVerify = true;
-    else if (a === '--help') { console.log('usage: node src/cli.mjs [--count N] [--domain D] [--delay-ms MS] [--workers N] [--no-verify]'); process.exit(0); }
+    else if (a === '--help') { console.log('usage: node src/cli.mjs [--count N] [--domain D] [--delay-ms MS] [--workers N] [--invite-code CODE] [--no-verify]'); process.exit(0); }
   }
   return o;
 }
@@ -50,6 +51,7 @@ async function main() {
     ...(o.domain !== undefined ? { domain: o.domain } : {}),
     ...(o.delayMs !== undefined ? { delayMs: o.delayMs } : {}),
     ...(o.workers !== undefined ? { workers: o.workers } : {}),
+    ...(o.inviteCode !== undefined ? { inviteCode: o.inviteCode } : {}),
   });
 
   console.log(`[config] domain=${cfg.domain} count=${cfg.count} workers=${cfg.workers} delay=${cfg.delayMs}ms`);
