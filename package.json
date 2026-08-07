@@ -1,14 +1,14 @@
 {
   "name": "tokenharbor-register",
   "version": "0.1.0",
-  "description": "Token Harbor (tokenharbor.ai) account registration via agent-browser + DataImpulse residential proxy + cloud-mail verification",
+  "description": "Pure-HTTP registration for Token Harbor (tokenharbor.ai): no browser, no proxy/mail required (both optional). React-19 server action replay + Supabase auto-confirm verification.",
   "type": "module",
   "bin": {
     "th-register": "src/cli.mjs"
   },
   "scripts": {
     "register": "node src/cli.mjs",
-    "test": "node --test test/"
+    "test": "node --test"
   },
   "engines": {
     "node": ">=20"

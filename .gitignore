@@ -1,5 +1,10 @@
 data/
 .env.local
+.env
 *.log
 node_modules/
 .DS_Store
+# local private operations / agent docs (not for the public repo)
+AGENTS.md
+scripts/
+mailbox-http-cli/node_modules/

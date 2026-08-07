@@ -1,66 +1,112 @@
 # tokenharbor-register
 
-Token Harbor (`tokenharbor.ai`) account registration bot.
+Pure-HTTP registration bot for [Token Harbor](https://tokenharbor.ai).
 
-Architecture follows the [aihub-register](https://github.com/catoncat/aihub-register)
-pattern (provider-neutral mailbox contract, batch CLI, JSONL account output) but
-drives the signup through `agent-browser` (CDP) because Token Harbor's signup is a
-Next.js **React 19 server action** with a Cloudflare **Turnstile** gate — the
-encrypted `$ACTION_REF_1` bound-args field cannot be reproduced by a plain HTTP
-client (verified: raw `curl` POST returns HTTP 500 `digest 182133037`).
+**No browser, no proxy, no mail service required.** Signup is a React 19
+server action whose encrypted-looking fields are actually client-published
+(the AES-128 `$ACTION_KEY` ships in the page HTML), so the whole flow is
+reproducible with `curl` + a cookie jar. Email verification is skipped too:
+on current signups Token Harbor auto-confirms the address (Supabase
+`email_confirmed_at`, written seconds after signup) and never sends a verify
+email — the mail step only exists as an optional fallback for edge cases.
 
-## Verified protocol (2026-08-06, live)
+## Flow (verified live, 2026-08-06)
 
-| Step | Request | Result |
-| --- | --- | --- |
-| 1 | `GET /login?mode=signup` | SSR form with hidden `$ACTION_KEY`, `$ACTION_1:0` (action id `603c964e…df296`), `device_fingerprint`, `timezone` |
-| 2 | `GET /api/auth/signup-precheck?fp=<fp>` | `{"needCaptcha":false}` on residential IP; `true` triggers Turnstile (sitekey `0x4AAAAAADBuC8Knz1EJZx9-`) |
-| 3 | POST signup server action | → redirect to `/dashboard` (account created, **API locked**) |
-| 4 | email from `verify@tokenharbor.ai` | "Verify your email to unlock API access", 24h link `https://tokenharbor.ai/verify-email?token=<base64>` |
-| 5 | open verify link | → `/dashboard?verify=success` (API unlocked) |
-| 6 | `/dashboard/api-keys` | create API key (optional post-step) |
-
-Email verification is **required** for API access, which is why this bot consumes
-the self-hosted [cloud-mail](https://github.com/catoncat/cloud-mail) receive-only
-mailbox (catch-all domains) via its CLI:
-
-```bash
-cloud-mail messages --email th-xxxx@dogfood.0day3.com --limit 10
+```
+GET /login?mode=signup            → parse $ACTION_KEY / $ACTION_1:0 / $ACTION_1:1
+GET /api/auth/signup-precheck     → needCaptcha:false (true ⇒ skipped, no bypass)
+POST signup server action (multipart)
+  email / password / invite_code / device_fingerprint=<random UUID> / timezone
+                                  → 303 /dashboard + Supabase session cookie
+Supabase check (retry ×4)         → email_confirmed_at ⇒ account verified
+  (fallback) mailbox provider     → open verify link if one was sent
+POST /api/keys                    → plaintext full key (e.g. thk_live_…)
+GET /dashboard                    → $5 gift confirmed
 ```
 
 ## Requirements
 
 - Node.js >= 20
-- `agent-browser` CLI (`npm i -g agent-browser && agent-browser install`)
-- `cloud-mail` CLI from the `apps/intake` app of the cloud-mail monorepo
-- DataImpulse residential proxy credentials at
-  `~/.agents/skills/residential-proxy/.secrets/dataimpulse.env` (mode 600),
-  or via `DIP_USERNAME` / `DIP_PASSWORD`
+- A catch-all mail domain you control (used as the account identity; any
+  domain that can receive mail to random local parts works — **the script does
+  not need to read it** unless you enable the mail fallback)
+
+Everything else is optional:
+- `cloud-mail`-compatible CLI (mail verify fallback)
+- DataImpulse residential proxy credentials (`--proxy sticky|rotate`)
+
+## Quick start
+
+```bash
+cp .env.example .env.local     # set TH_FIXED_POOL (or TH_DOMAIN) + invite code
+node src/cli.mjs --count 1
+```
 
 ## Usage
 
 ```bash
-cp .env.example .env.local   # edit domain / counts
-node src/cli.mjs --count 1                    # single account
-node src/cli.mjs --count 6 --workers 3        # concurrent batch
-node src/cli.mjs --domain kada.cam --count 2  # pick another catch-all domain
+node src/cli.mjs --count 1                          # single account, direct IP
+node src/cli.mjs --count 6 --workers 2              # concurrent batch
+node src/cli.mjs --count 2 --domain-mode pool       # fixed pool only
+node src/cli.mjs --count 2 --proxy sticky           # per-account residential IP
+node src/cli.mjs --count 2 --domain mail.example.com  # single-domain mode
 ```
 
-Each account:
-- gets its own `agent-browser` session and its own **DataImpulse sticky** proxy
-  (`__<cc>;sessid.<id>`, port 10000–20000) so IPs are never shared
-- uses a random catch-all address `th-<hex>@<domain>`
-- is appended as one JSON line to `data/accounts.jsonl` (0600) with status
-  `created` / `verified` / `created-unverified` / `captcha-required` / `failed`
+| Option | Meaning |
+| --- | --- |
+| `--count N` | number of accounts (default 1) |
+| `--workers N` | parallel workers |
+| `--domain-mode dynamic\|pool\|single` | domain strategy (default `dynamic`) |
+| `--domain D` | fixed single catch-all domain |
+| `--proxy direct\|sticky\|rotate` | network mode (default `direct`) |
+| `--invite-code CODE` | referral code |
+| `--no-verify` | skip the verification step |
 
-No CAPTCHA bypass: if `signup-precheck` demands Turnstile the account is recorded
-as `captcha-required` and skipped.
+Every account appends one JSON line to `data/accounts.jsonl` (0600) with
+`email`, `password`, `sess_id`, `status` (`created` / `verified` /
+`created-unverified` / `captcha-required` / `failed`), `invite_code`,
+`api_key`, `gift_claimed`, `balance`, `note`.
 
-## Notes
+## Domain setup
 
-- Use only for accounts you are authorized to create; respect the service's terms
-  and rate limits.
-- Verify-email links expire after 24 hours; `--no-verify` skips the mailbox step.
-- The `mailbox-http-cli/` directory is the provider-neutral adapter from
-  aihub-register and is kept for parity; the default mailbox backend is the
-  cloud-mail CLI itself (output shape already matches the contract).
+Three strategies, all reading from `.env.local`:
+
+- **pool** — round-robin over `TH_FIXED_POOL=a.com,b.com` (comma-separated).
+  Only domains you know are catch-all.
+- **dynamic** (default) — pool plus automatic top-up: when the batch needs
+  more domains than `TH_DOMAIN_MAX_REUSE` accounts per domain, it creates
+  fresh subdomains under `TH_DYNAMIC_ZONES` via Cloudflare Email Routing +
+  a worker allowlist. Requires CF credentials via `envchain`
+  (`CF_ENVCHAIN_SCOPE`, default `cf-migrate-target`) — without them it falls
+  back to pool mode.
+- **single** — one fixed domain (`--domain` / `TH_DOMAIN`).
+
+No domains are hardcoded in the source.
+
+## Mail verification
+
+- `TH_MAIL_MODE=none` (default): rely on Supabase auto-confirm. Fast, zero
+  mail dependencies.
+- `TH_MAIL_MODE=cloud-mail`: additionally poll a mailbox CLI
+  (`messages --email <addr> --limit N` → `{items:[…]}`) for the verify link,
+  used only when the account was not auto-confirmed. The
+  [`mailbox-http-cli/`](mailbox-http-cli/README.md) directory is a
+  provider-neutral adapter that turns any HTTP mailbox API into that contract.
+
+## Proxy
+
+`direct` is the default and works — signups pass from a plain residential/DC
+IP. `sticky` gives each account its own DataImpulse sticky IP
+(`__<cc>;sessid.<id>`, port 10000–20000) for batches that want IP separation.
+On proxied IPs a GET with a cookie jar before the POST satisfies the Vercel
+security checkpoint (handled automatically).
+
+## Guardrails
+
+- **No CAPTCHA bypass.** If `signup-precheck` returns `needCaptcha:true`
+  (Turnstile), the account is recorded `captcha-required` and skipped.
+- `data/` and `.env.local` are gitignored; credentials never leave your box.
+- Use only for accounts you are authorized to create, and respect the
+  service's terms and rate limits. Verify links (when sent) expire in 24h.
+- Turnstile demands are flaky on some IPs — a `captcha-required` account is
+  expected occasionally in large batches, not an error.

@@ -5,6 +5,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
+import { FIXED_POOL, DYNAMIC_ZONES } from './domains.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 export const PROJECT_ROOT = join(here, '..');
@@ -38,26 +39,64 @@ export function loadConfig(overrides = {}) {
   const password = env.DIP_PASSWORD || dip.password || '';
   const host = env.DIP_HOST || dip.host || 'gw.dataimpulse.com';
 
+  const splitList = (v) =>
+    String(v || '').split(',').map((s) => s.trim().toLowerCase().replace(/^@/, '')).filter(Boolean);
+
   const cfg = {
-    domain: (env.TH_DOMAIN || 'dogfood.0day3.com').replace(/^@/, ''),
+    domain: (env.TH_DOMAIN || '').replace(/^@/, ''),
     mailboxCli: env.MAILBOX_CLI || 'cloud-mail',
+    // mail verification provider. 'none' (default) relies on Supabase
+    // auto-confirm (email_confirmed_at); 'cloud-mail' also polls a mailbox
+    // CLI for the verify link as a fallback.
+    mailMode: env.MAIL_MODE || 'none',
     dip: { username, password, host, rotatePort: Number(env.DIP_ROTATE_PORT || 823) },
     dipCountry: env.DIP_COUNTRY || 'us',
     count: Number(env.TH_COUNT || 1),
     delayMs: Number(env.TH_DELAY_MS || 8000),
     workers: Number(env.TH_WORKERS || 1),
     inviteCode: env.TH_INVITE_CODE || '',
+    // proxy: 'direct' (default, no proxy) | 'sticky' (per-account residential IP) | 'rotate'
+    proxyMode: env.TH_PROXY_MODE || 'direct',
+    timezone: env.TH_TIMEZONE || 'Asia/Shanghai',
     signupTimeout: Number(env.TH_SIGNUP_TIMEOUT || 60),
     mailTimeout: Number(env.TH_MAIL_TIMEOUT || 150),
     mailPollInterval: Number(env.TH_MAIL_POLL_INTERVAL || 5),
     accountsFile: env.TH_ACCOUNTS_FILE || 'data/accounts.jsonl',
+    // domain strategy: 'dynamic' (fixed pool + auto top-up of fresh readable
+    // subdomains when the batch exceeds maxReuse accounts/domain), 'pool'
+    // (round-robin fixed 23-domain pool only), or 'single' (fixed TH_DOMAIN)
+    domainMode: env.TH_DOMAIN_MODE || 'dynamic',
+    dynamicZones: splitList(env.TH_DYNAMIC_ZONES).length ? splitList(env.TH_DYNAMIC_ZONES) : DYNAMIC_ZONES,
+    fixedPool: splitList(env.TH_FIXED_POOL).length ? splitList(env.TH_FIXED_POOL) : FIXED_POOL,
+    domainMaxReuse: Number(env.TH_DOMAIN_MAX_REUSE || 2),
+    cfEnvchainScope: env.CF_ENVCHAIN_SCOPE || 'cf-migrate-target',
+    cfKeychainDir: env.CF_KEYCHAIN_DIR || join(homedir(), 'Library', 'Keychains', 'envchain-scopes'),
     ...overrides,
   };
 
-  if (!cfg.dip.username || !cfg.dip.password) {
+  // a fixed TH_DOMAIN / --domain forces single-domain mode
+  if (cfg.domain) cfg.domainMode = 'single';
+
+  // refuse to run with no catch-all domains (the pool is no longer hardcoded).
+  // Must be navigated: .env.local TH_FIXED_POOL / TH_DYNAMIC_ZONES, or single mode.
+  if (cfg.domainMode !== 'single') {
+    const hasDomains = (cfg.dynamicZones?.length || 0) > 0 || (cfg.fixedPool?.length || 0) > 0;
+    if (!hasDomains) {
+      throw new Error(
+        'no catch-all domains configured. Provide TH_FIXED_POOL / TH_DYNAMIC_ZONES ' +
+          '(comma-separated) in .env.local, or use --domain-mode single --domain <yours>.'
+      );
+    }
+  } else if (!cfg.domain) {
+    throw new Error('domain-mode single requires --domain <yours> or TH_DOMAIN.');
+  }
+
+  // proxy credentials are only required when a proxy mode is actually used;
+  // the default `direct` mode needs none.
+  if (cfg.proxyMode !== 'direct' && (!cfg.dip.username || !cfg.dip.password)) {
     throw new Error(
-      'DataImpulse credentials missing. Set DIP_USERNAME/DIP_PASSWORD or ensure ' +
-        '~/.agents/skills/residential-proxy/.secrets/dataimpulse.env exists (mode 600).'
+      `proxyMode=${cfg.proxyMode} requires DataImpulse credentials. Set DIP_USERNAME/DIP_PASSWORD ` +
+        'env vars (or your credential file mounted under a path resolvable by readSecretEnvFile), or use --proxy direct.'
     );
   }
   return cfg;

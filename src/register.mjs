@@ -1,243 +1,188 @@
-// Single-account registration flow for tokenharbor.ai.
+// Pure-protocol registration flow for tokenharbor.ai (no browser, 2026-08-06).
 //
-// Steps (verified live 2026-08-06):
-//   1. open /login?mode=signup (residential sticky IP)
-//   2. fill email (catch-all on the cloud-mail domain) + password
-//   3. submit the React 19 server-action form (Create account)
-//   4. wait for /dashboard -> account created (API locked until verified)
-//   5. poll cloud-mail for the verify-email link (24h expiry)
-//   6. open the verify link -> /dashboard?verify=success (API unlocked)
+// Steps (verified live):
+//   1. GET /login?mode=signup with a cookie jar (on residential IPs the jar
+//      is what satisfies the Vercel Security Checkpoint; without it the POST
+//      is bounced back with the signup page)
+//   2. parse the React-19 server-action binding fields ($ACTION_KEY is an
+//      AES-128 key shipped in cleartext -> payload is constructible)
+//   3. signup-precheck; if needCaptcha -> mark `captcha-required` and skip
+//      (Turnstile is never bypassed)
+//   4. multipart POST with email/password/invite_code/device_fingerprint
+//      (random UUID - that's all the frontend does) /timezone -> 303 +
+//      Supabase session cookie
+//   5. poll cloud-mail for the verify link, open it over HTTP -> 307
+//      /dashboard?verify=success (no cookie needed, token self-authorizes)
+//   6. POST /api/keys -> plaintext full key; dashboard body confirms $5 gift
 //
-// No CAPTCHA/Turnstile bypass: if the signup-precheck returns needCaptcha
-// the account is marked `captcha-required` and skipped, not forced.
+// Proxy is OPTIONAL and off by default (`direct`). Use --proxy sticky|rotate
+// when the production batch needs per-account residential IPs.
 
-import { Browser } from './browser.mjs';
-import { Mailbox, sleep } from './mailbox.mjs';
-import { randomHex, stickyEndpoint } from './config.mjs';
+import { createMailProvider, sleep } from './mailbox.mjs';
+import { randomHex } from './config.mjs';
+import { randomUUID } from 'node:crypto';
+import { rmSync } from 'node:fs';
+import {
+  resolveProxy,
+  httpRequest,
+  fetchActionPage,
+  signupPrecheck,
+  postSignup,
+  openVerify,
+  createApiKey,
+  supabaseGetUser,
+  SIGNUP_URL,
+  HOST,
+} from './http.mjs';
 
-export const SIGNUP_URL = 'https://tokenharbor.ai/login?mode=signup';
-export const HOST = 'https://tokenharbor.ai';
+export { SIGNUP_URL, HOST };
 
 export async function registerOne(cfg, { email, password, log = () => {} }) {
   const sessId = `th${randomHex(6)}`;
-  const proxyUrl = stickyEndpoint(cfg, sessId);
-  const browser = new Browser({ session: `th-reg-${sessId}`, proxyUrl });
-  const mailbox = new Mailbox({ cli: cfg.mailboxCli });
+  const proxy = resolveProxy(cfg, sessId);
+  const jar = `/tmp/th-reg-${process.pid}-${sessId}.jar`;
+  const mail = createMailProvider(cfg.mailMode, { cli: cfg.mailboxCli });
 
   const result = {
     email,
     password,
     sess_id: sessId,
-    proxy: maskProxy(proxyUrl),
+    proxy: proxy ? maskProxy(proxy) : 'direct',
     created_at: new Date().toISOString(),
     status: 'pending',
   };
 
   try {
-  // 1. open the signup page (retry once on transient CF/network failures)
-  await openWithRetry(browser, SIGNUP_URL, { timeoutMs: 90000 });
-  await sleep(3500);
-  let st = await browser.state();
-  if (!st?.url?.includes('tokenharbor.ai')) {
-    throw new Error(`page did not load tokenharbor (got ${st?.url || 'no url'})`);
-  }
-
-  // dismiss the cookie consent banner so it cannot cover the submit button
-  await browser.eval(`(()=>{const b=[...document.querySelectorAll('button')].find(x=>/essential only|accept analytics/i.test(x.innerText));if(b){b.click();return 'dismissed'}return 'none'})()`);
-  await sleep(800);
-
-  // 2. fill the form
-  await browser.fill('input[name="email"]', email);
-  await browser.fill('input[name="password"]', password);
-  if (cfg.inviteCode) {
-    try {
-      await browser.fill('input[name="invite_code"]', cfg.inviteCode);
-      result.invite_code = cfg.inviteCode;
-    } catch {
-      /* optional field may not be present */
+    // 1. signup page (jar must be shared with the POST below)
+    const page = fetchActionPage({ jar, proxy });
+    if (!page.key || page.status !== 200) {
+      result.status = 'failed';
+      result.error = `signup page fetch failed (http ${page.status})`;
+      log(`[!] ${result.error}`);
+      return result;
     }
-  }
-  const before = await browser.eval(
-    `JSON.stringify({email:document.querySelector('input[name=email]')?.value||'',pw:document.querySelector('input[name=password]')?.value?.length||0,hasTurnstile:!!document.querySelector('[name=cf-turnstile-response]')})`
-  );
-  if (!before?.email) throw new Error('signup form did not render (email empty)');
-  if (before.hasTurnstile) {
-    result.status = 'captcha-required';
-    result.note = 'signup-precheck requested Turnstile; not bypassed';
-    return result;
-  }
+    const fp = randomUUID();
+    result.device_fingerprint = fp;
 
-  // 3. submit via form.requestSubmit() so the React 19 server action fires
-  //    even if a floating layer would otherwise cover the submit button.
-  await browser.eval(`(()=>{
-    const emailInput=document.querySelector('input[name="email"]');
-    const form=emailInput && emailInput.closest('form');
-    if(form){form.requestSubmit();return 'requestSubmit'}
-    const btn=[...document.querySelectorAll('button')].find(b=>b.type==='submit')||document.querySelector('button[type="submit"]');
-    if(btn){btn.click();return 'button-click'}
-    return 'no-form';
-  })()`);
-  await sleep(2500);
-
-  // 4. wait for the dashboard. NOTE: the React 19 server action renders the
-  //    dashboard content WITHOUT changing location.href (observed live: URL
-  //    stays /login?mode=signup for >70s while the body becomes the
-  //    dashboard). So we detect the dashboard by its body, not by URL.
-  let landed = false;
-  const deadline = Date.now() + cfg.signupTimeout * 1000;
-  while (Date.now() < deadline) {
-    let s = null;
-    try { s = await browser.state(); } catch { /* keep polling */ }
-    const body = (s?.body || '');
-    const isDashboard = /BALANCE/.test(body) && /Overview/.test(body) && /API Key/.test(body);
-    const stillSignup = /Create account|Sign up to|one time pin/i.test(body) && !/BALANCE/.test(body);
-    if (isDashboard && !stillSignup) {
-      landed = true;
-      result.dashboard_url = s?.url || '';
-      result.status = 'created';
-      log(`[+] account created (dashboard body detected)`);
-      break;
+    // 2. precheck — never bypass Turnstile
+    const pre = signupPrecheck(fp, { proxy });
+    if (pre.needCaptcha) {
+      result.status = 'captcha-required';
+      result.note = 'signup-precheck requested Turnstile; not bypassed';
+      log(`[!] ${result.note}`);
+      return result;
     }
-    await sleep(1500);
-  }
-  if (!landed) {
-    let s2 = null;
-    try { s2 = await browser.state(); } catch {}
-    const body = (s2?.body || '').slice(0, 300);
-    result.note = `signup did not reach dashboard: ${body}`;
-    log(`[!] signup did not reach dashboard: ${body}`);
-    return result;
-  }
 
-  // 5. poll mailbox for the verify email
-  try {
-    const { link } = await mailbox.waitForVerifyLink(email, {
-      timeoutMs: cfg.mailTimeout * 1000,
-      intervalMs: cfg.mailPollInterval * 1000,
-      log,
+    // 3. submit the server action
+    const r = postSignup({
+      email, password, invite: cfg.inviteCode, fp,
+      actionKey: page.key, actionMeta: page.meta, actionArgs: page.args,
+      jar, proxy,
     });
-    result.verify_link = link;
+    if (r.code !== 303) {
+      result.status = 'failed';
+      result.error = `signup http ${r.code} ${r.body.slice(0, 160)}`;
+      log(`[!] signup http ${r.code}`);
+      return result;
+    }
+    result.status = 'created';
+    log(`[+] account created (303 -> ${r.location})`);
 
-    // 6. open the verify link (same session/sticky IP)
-    await openWithRetry(browser, link, { timeoutMs: 60000 });
-    await sleep(3500);
-    const vs = await browser.state().catch(() => null);
-    const vBody = vs?.body || '';
-    const vUrl = vs?.url || '';
-    if (vUrl.includes('verify=success') || (/BALANCE/.test(vBody) && /Overview/.test(vBody))) {
+    // 4. determine email-verification. Two signals (2026-08-06):
+    //   - signups on these IPs are auto-confirmed (email_confirmed_at written
+    //     ~6s after signup) with NO verify email sent -> poll Supabase with
+    //     short retries (fast, no 150s wait)
+    //   - if Supabase stays unconfirmed, fall back to mailbox polling
+    let supaUser = null;
+    for (let i = 0; i < 4 && !supaUser?.email_confirmed_at; i++) {
+      if (i) await sleep(3000);
+      supaUser = await supabaseGetUser(email, password);
+    }
+    if (supaUser?.email_confirmed_at) {
       result.status = 'verified';
-      log(`[+] email verified -> ${vUrl}`);
+      result.note = 'email auto-confirmed (no verify mail)';
+      log('[+] email auto-confirmed (no verify mail needed)');
     } else {
-      result.status = 'created-unverified';
-      result.note = `verify link opened but dashboard not confirmed (${vUrl})`;
+      // Supabase still unconfirmed; ask the mail provider for the verify link.
+      // With mailMode=none this returns null immediately and the account is
+      // recorded created-unverified (a verified status cannot be assumed).
+      let link = null;
+      try {
+        link = await mail.waitVerifyLink(email, {
+          timeoutMs: cfg.mailTimeout * 1000,
+          intervalMs: cfg.mailPollInterval * 1000,
+          log,
+        });
+      } catch (err) {
+        result.note = `verify link lookup failed: ${err.message}`;
+        log(`[!] ${result.note}`);
+      }
+      if (link) {
+        result.verify_link = link;
+        const v = openVerify(link, { jar, proxy });
+        const ok = !!v.location?.includes('verify=success') || (/BALANCE/.test(v.body) && /Overview/.test(v.body));
+        if (ok) {
+          result.status = 'verified';
+          log(`[+] email verified -> ${v.location || 'dashboard'}`);
+        } else {
+          result.status = 'created-unverified';
+          result.note = `verify link opened but not confirmed (${v.location || 'http ' + v.code})`;
+          log(`[!] ${result.note}`);
+        }
+      } else {
+        result.status = 'created-unverified';
+        result.note = result.note || `no verify mail (mailMode=${cfg.mailMode}) and email not confirmed in Supabase`;
+        log(`[!] created-unverified: ${result.note}`);
+      }
     }
-  } catch (err) {
-    result.status = 'created-unverified';
-    result.note = `verify email not found: ${err.message}`;
-    log(`[!] ${result.note}`);
-  }
 
-  // 7. post-register: claim the $5 gift, enable free models, create an API key.
-  //    Best-effort: failures are recorded but do not undo the account.
-  if (result.status === 'verified') {
-    try {
-      await postRegisterSetup(browser, result, log);
-    } catch (err) {
-      result.note = [result.note, `post-register: ${err.message}`].filter(Boolean).join(' | ');
-      log(`[!] post-register partial: ${err.message}`);
+    // 5. post-register over HTTP: create API key + confirm $5 gift.
+    //    Best-effort: failures are recorded but do not undo the account.
+    if (result.status === 'verified') {
+      try {
+        await postRegisterSetupHTTP(cfg, { jar, proxy, result, log });
+      } catch (err) {
+        result.note = [result.note, `post-register: ${err.message}`].filter(Boolean).join(' | ');
+        log(`[!] post-register partial: ${err.message}`);
+      }
     }
-  }
 
-  return result;
+    return result;
   } finally {
-    // always close the per-account browser session, even on failure,
-    // so batch runs do not leak Chrome instances
-    await browser.close();
+    rmSync(jar, { force: true });
   }
 }
 
-/** Claim welcome gift, enable free models, create API key (same session). */
-export async function postRegisterSetup(browser, result, log) {
-  // claim $5 welcome gift: open the gift panel then press Claim
-  await openWithRetry(browser, 'https://tokenharbor.ai/dashboard', { timeoutMs: 60000 });
-  await sleep(2500);
-  const claim = await browser.eval(`(()=>{
-    const open=[...document.querySelectorAll('button')].find(b=>/gift to claim/i.test(b.innerText));
-    if(!open) return {skipped:'no-gift'};
-    open.click();
-    return {opened:true};
-  })()`);
-  await sleep(2000);
-  const claimed = await browser.eval(`(()=>{
-    const c=[...document.querySelectorAll('button')].find(b=>b.innerText.trim()==='Claim');
-    if(!c) return {claimed:false,reason:'no-claim-btn'};
-    c.click();
-    return {claimed:true};
-  })()`);
-  await sleep(3000);
-  if (claimed?.claimed) { result.gift_claimed = true; log('[+] $5 gift claimed'); }
-
-  // enable free models (no-op if already enabled / absent)
-  await browser.eval(`(()=>{
-    const b=[...document.querySelectorAll('button')].find(x=>x.innerText.trim()==='Enable free models');
-    if(b){b.click();return 'on'}
-    return 'absent';
-  })()`);
-  await sleep(2000);
-  result.free_models_enabled = true;
-  log('[+] free models enabled');
-
-  // create an API key on /dashboard/api-keys (full key shown once)
-  await openWithRetry(browser, 'https://tokenharbor.ai/dashboard/api-keys', { timeoutMs: 60000 });
-  await sleep(2500);
-  await browser.eval(`(()=>{const b=[...document.querySelectorAll('button')].find(x=>/new key/i.test(x.innerText));if(b)b.click();return 'ok'})()`);
-  await sleep(1800);
-  await browser.eval(`(()=>{
-    const i=[...document.querySelectorAll('input')].find(x=>/cursor|production|side project/i.test(x.placeholder||''));
-    if(!i) return 'no-input';
-    const setter=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;
-    setter.call(i,'bot-key');
-    i.dispatchEvent(new Event('input',{bubbles:true}));
-    const b=[...document.querySelectorAll('button')].find(x=>x.innerText.trim()==='Create key');
-    if(b) b.click();
-    return 'created';
-  })()`);
-  await sleep(2500);
-  // The full key is shown once in a <code> element. Its prefix is NOT fixed
-  // (observed both `thk_live_A_…` and `thk_live_-…`); masked entries contain
-  // `•`, so match the base64url body of an unmasked key only.
-  const key = await browser.eval(`(()=>{
-    const els=[...document.querySelectorAll('code')].map(e=>e.innerText.trim());
-    return els.find(t=>/^thk_live_[A-Za-z0-9_-]{20,}$/.test(t)) || null;
-  })()`);
-  if (key) {
-    result.api_key = key;
-    log('[+] API key created');
+/** Create an API key (plaintext in response) + confirm the $5 gift via dashboard body. */
+export async function postRegisterSetupHTTP(cfg, { jar, proxy, result, log }) {
+  const kr = createApiKey({ label: 'bot-key', jar, proxy });
+  if (kr.code === 200 || kr.code === 201) {
+    try {
+      const j = JSON.parse(kr.body);
+      if (j.plaintext) {
+        result.api_key = j.plaintext;
+        log('[+] API key created');
+      } else {
+        log('[!] api/keys response had no plaintext');
+      }
+    } catch {
+      log('[!] api/keys response not JSON');
+    }
   } else {
-    log('[!] API key not captured');
+    log(`[!] api/keys http ${kr.code}`);
   }
 
-  // read the balance
-  await openWithRetry(browser, 'https://tokenharbor.ai/dashboard', { timeoutMs: 60000 });
-  await sleep(2000);
-  const bal = await browser.eval(`(()=>{const t=document.body.innerText;const m=t.match(/\\$\\d+(?:\\.\\d+)?/);return m?m[0]:null})()`);
-  if (bal) result.balance = bal;
+  const d = httpRequest({ method: 'GET', url: `${HOST}/dashboard`, jar, proxy, timeout: 20000 });
+  if (d.code === 200) {
+    const five = d.body.match(/\$5(\.00)?/);
+    if (five) {
+      result.gift_claimed = true;
+      result.balance = five[0];
+      log('[+] $5 gift confirmed');
+    }
+  }
 }
 
 function maskProxy(url) {
   return url.replace(/:\/\/[^@]+@/, '://***:***@');
-}
-
-async function openWithRetry(browser, url, opts, attempts = 3) {
-  let lastErr;
-  for (let i = 1; i <= attempts; i++) {
-    try {
-      await browser.open(url, opts);
-      return;
-    } catch (err) {
-      lastErr = err;
-      await sleep(2000 * i);
-    }
-  }
-  throw lastErr;
 }

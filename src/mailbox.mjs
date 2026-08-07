@@ -14,14 +14,23 @@ export class Mailbox {
   }
 
   async messages(email, limit = 10, timeoutMs = 20000) {
-    const { stdout } = await execFileAsync(this.cli, ['messages', '--email', email, '--limit', String(limit)], {
-      timeout: timeoutMs,
-      maxBuffer: 4 * 1024 * 1024,
-    });
-    const data = JSON.parse(stdout);
-    const items = data.items || [];
-    if (!Array.isArray(items)) throw new Error('mailbox response missing items array');
-    return items;
+    let lastErr;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const { stdout } = await execFileAsync(this.cli, ['messages', '--email', email, '--limit', String(limit)], {
+          timeout: timeoutMs,
+          maxBuffer: 4 * 1024 * 1024,
+        });
+        const data = JSON.parse(stdout);
+        const items = data.items || [];
+        if (!Array.isArray(items)) throw new Error('mailbox response missing items array');
+        return items;
+      } catch (err) {
+        lastErr = err;
+        if (attempt < 2) await sleep(1200); // transient TLS/reset — retry
+      }
+    }
+    throw lastErr;
   }
 
   /** Poll until a verify link from Token Harbor appears, or timeout. */
@@ -56,4 +65,30 @@ export function extractVerifyLink(item) {
 
 export function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Mail verification provider factory.
+ *   'none' (default)       -> waitVerifyLink always resolves null; relies on
+ *                             Supabase auto-confirm (email_confirmed_at).
+ *   'cloud-mail' (optional)-> polls a cloud-mail CLI inbox for the verify link.
+ * Anything else throws so misconfiguration is loud.
+ */
+export function createMailProvider(mode = 'none', { cli = 'cloud-mail' } = {}) {
+  if (!mode || mode === 'none') {
+    return {
+      name: 'none',
+      async waitVerifyLink() {
+        return null;
+      },
+    };
+  }
+  if (mode === 'cloud-mail') {
+    const mb = new Mailbox({ cli });
+    return {
+      name: 'cloud-mail',
+      waitVerifyLink: (email, opts) => mb.waitForVerifyLink(email, opts),
+    };
+  }
+  throw new Error(`unknown mailMode '${mode}' (expected 'none' | 'cloud-mail')`);
 }
