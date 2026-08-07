@@ -2,14 +2,20 @@
 
 Pure-HTTP registration bot for [Token Harbor](https://tokenharbor.ai).
 
-**No browser, no proxy required.** Token Harbor's signup is a React 19 server
-action whose `$ACTION_KEY` is published in the page HTML — so the whole flow is
-reproducible with `curl` + a cookie jar. A real mailbox is still required for
-each account (the API returns `403 email_not_verified` until the verify link is
-opened), but the [**cloud-mail**](https://github.com/catoncat/cloud-mail) CLI
-handles that.
+Signup on Token Harbor is a React 19 server action whose fields are
+client-published, so the whole flow is reproducible with `curl` and a cookie
+jar — no browser needed. A real mailbox is required per account, because Token
+Harbor only unlocks the API after the verify link in the email is opened.
 
-## Flow (verified live)
+## What it does
+
+- Registers accounts via the pure-HTTP signup flow (no browser, no proxy by default)
+- Polls a mailbox for the verify email and opens the activation link
+- Claims the $5 welcome grant, enables free models, creates an API key
+- Confirms the balance from Supabase (the authoritative source)
+- Appends one JSON record per account to `data/accounts.jsonl` (0600, gitignored)
+
+## Flow
 
 ```
 GET /login?mode=signup            → parse $ACTION_KEY / $ACTION_1:0 / $ACTION_1:1
@@ -21,12 +27,12 @@ POST /api/me/send-verification-email → ask the app to send the mail
 Poll mailbox for verify link      → https://tokenharbor.ai/verify-email?token=...
 Open verify link                  → /dashboard?verify=success (API unlocked)
 POST /api/welcome/claim           → $5 welcome grant credited
-POST /api/me/privacy              → enable free-models tier (DeepSeek V4 Flash, MiMo V2.5)
+POST /api/me/privacy              → enable free-models tier
 POST /api/keys                    → plaintext full key (thk_live_...)
 GET /rest/v1/wallets              → confirm balance from Supabase
 ```
 
-> ⚠️ **Mail verification is mandatory.** Supabase writes `email_confirmed_at`
+> **Mail verification is mandatory.** Supabase writes `email_confirmed_at`
 > seconds after signup, but Token Harbor ignores it — the API returns
 > `403 email_not_verified` until the mailbox link is opened. A `TH_MAIL_MODE`
 > of `none` produces locked accounts only.
@@ -34,12 +40,11 @@ GET /rest/v1/wallets              → confirm balance from Supabase
 ## Requirements
 
 - Node.js >= 20
-- A catch-all mail domain you control (used as the account identity)
-- A mailbox CLI that can retrieve messages for that domain
-  (the [`mailbox-http-cli/`](mailbox-http-cli/README.md) adapter turns any
-  HTTP mailbox API into the required contract)
+- A catch-all mail domain you control
+- A mailbox backend that can retrieve messages for that domain (see
+  [Mail verification](#mail-verification) below)
 
-Everything else is optional:
+Optional:
 - DataImpulse residential proxy credentials (`--proxy sticky|rotate`)
 
 ## Quick start
@@ -83,30 +88,24 @@ Three strategies, all reading from `.env.local`:
 - **dynamic** (default) — pool plus automatic top-up: when the batch needs
   more domains than `TH_DOMAIN_MAX_REUSE` accounts per domain, it creates
   fresh subdomains under `TH_DYNAMIC_ZONES` via Cloudflare Email Routing +
-  a worker allowlist. Requires CF credentials via `envchain`
-  (`CF_ENVCHAIN_SCOPE`, default `cf-migrate-target`) — without them it falls
-  back to pool mode.
+  a worker allowlist. Requires Cloudflare credentials via `envchain`
+  (`CF_ENVCHAIN_SCOPE`) — without them it falls back to pool mode.
 - **single** — one fixed domain (`--domain` / `TH_DOMAIN`).
 
 No domains are hardcoded in the source.
 
 ## Mail verification
 
-The registrar needs a real mailbox per account: Token Harbor only unlocks the
-API after the verify link in the email is opened. This repo uses
-[**cloud-mail**](https://github.com/catoncat/cloud-mail) — a self-hosted,
-receive-only mail platform on Cloudflare that we built:
+Each account needs a mailbox that can receive the verify email and expose it
+over a CLI that answers `messages --email <addr> --limit N` with
+`{ "items": [...] }`. The [`mailbox-http-cli/`](mailbox-http-cli/README.md)
+directory is a provider-neutral adapter that turns any HTTP mailbox API into
+that contract, so you can plug in any backend.
 
-- Bring your own domains (multi-domain catch-all via Cloudflare Email Routing)
-- Receive mail at any address on those domains
-- Read verification codes / magic links from a UI, a REST API, or the
-  `cloud-mail` CLI (`messages --email <addr> --limit N`)
-
-This repo talks to it through the [`cloud-mail` CLI](https://github.com/catoncat/cloud-mail)
-contract, and [`mailbox-http-cli/`](mailbox-http-cli/README.md) is a
-provider-neutral adapter that turns **any** HTTP mailbox API into the same
-contract — so you can point the registrar at a different mailbox backend
-without changing the registration code.
+One convenient option is [**cloud-mail**](https://github.com/catoncat/cloud-mail),
+a self-hosted receive-only mail platform on Cloudflare: bring your own domains,
+receive mail at any address on them, and read verification codes / magic links
+from a UI, a REST API, or a CLI.
 
 - `TH_MAIL_MODE=cloud-mail` (default): poll the mailbox for the verify link.
 - `TH_MAIL_MODE=none`: skip mail verification. Produces **API-locked** accounts
@@ -119,14 +118,6 @@ gives each account its own DataImpulse sticky IP
 (`__<cc>;sessid.<id>`, port 10000–20000) for batches that want IP separation.
 On proxied IPs a GET with a cookie jar before the POST satisfies the Vercel
 security checkpoint (handled automatically).
-
-## Operations layer
-
-Beyond the registrar, this repo ships a pure-HTTP **operations layer** —
-auto-supply, a read-only pool CLI, and an optional local gateway — that turns
-a pool of accounts into a self-managing, funded backend. See
-[`docs/operations.md`](docs/operations.md) for the design (refill-early,
-single-current-key, use-to-dregs) and the config surface.
 
 ## Guardrails
 
