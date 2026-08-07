@@ -8,13 +8,3 @@ node_modules/
 AGENTS.md
 scripts/
 mailbox-http-cli/node_modules/
-
-# local operations layer — private plumbing (supply, gateway, key pool, board)
-# these read ~/.pi/agent/secrets and ~/Library/LaunchAgents, so they stay local
-src/supply.mjs
-src/th-supply.mjs
-src/gateway.mjs
-src/pool.mjs
-src/th.mjs
-src/th-api.mjs
-src/register-browser.mjs

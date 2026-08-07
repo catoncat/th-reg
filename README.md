@@ -6,7 +6,8 @@ Pure-HTTP registration bot for [Token Harbor](https://tokenharbor.ai).
 action whose `$ACTION_KEY` is published in the page HTML — so the whole flow is
 reproducible with `curl` + a cookie jar. A real mailbox is still required for
 each account (the API returns `403 email_not_verified` until the verify link is
-opened), but the `cloud-mail` CLI handles that.
+opened), but the [**cloud-mail**](https://github.com/catoncat/cloud-mail) CLI
+handles that.
 
 ## Flow (verified live)
 
@@ -91,14 +92,25 @@ No domains are hardcoded in the source.
 
 ## Mail verification
 
-- `TH_MAIL_MODE=cloud-mail` (default): polls a mailbox CLI
-  (`messages --email <addr> --limit N` → `{items:[...]}`) for the verify link.
+The registrar needs a real mailbox per account: Token Harbor only unlocks the
+API after the verify link in the email is opened. This repo uses
+[**cloud-mail**](https://github.com/catoncat/cloud-mail) — a self-hosted,
+receive-only mail platform on Cloudflare that we built:
+
+- Bring your own domains (multi-domain catch-all via Cloudflare Email Routing)
+- Receive mail at any address on those domains
+- Read verification codes / magic links from a UI, a REST API, or the
+  `cloud-mail` CLI (`messages --email <addr> --limit N`)
+
+This repo talks to it through the [`cloud-mail` CLI](https://github.com/catoncat/cloud-mail)
+contract, and [`mailbox-http-cli/`](mailbox-http-cli/README.md) is a
+provider-neutral adapter that turns **any** HTTP mailbox API into the same
+contract — so you can point the registrar at a different mailbox backend
+without changing the registration code.
+
+- `TH_MAIL_MODE=cloud-mail` (default): poll the mailbox for the verify link.
 - `TH_MAIL_MODE=none`: skip mail verification. Produces **API-locked** accounts
   (403 `email_not_verified`), only useful for account shells.
-
-The [`mailbox-http-cli/`](mailbox-http-cli/README.md) directory is a
-provider-neutral adapter that turns any HTTP mailbox API into the contract
-the script expects.
 
 ## Proxy
 
@@ -107,6 +119,14 @@ gives each account its own DataImpulse sticky IP
 (`__<cc>;sessid.<id>`, port 10000–20000) for batches that want IP separation.
 On proxied IPs a GET with a cookie jar before the POST satisfies the Vercel
 security checkpoint (handled automatically).
+
+## Operations layer
+
+Beyond the registrar, this repo ships a pure-HTTP **operations layer** —
+auto-supply, a read-only pool CLI, and an optional local gateway — that turns
+a pool of accounts into a self-managing, funded backend. See
+[`docs/operations.md`](docs/operations.md) for the design (refill-early,
+single-current-key, use-to-dregs) and the config surface.
 
 ## Guardrails
 

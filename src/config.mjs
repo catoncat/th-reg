@@ -76,6 +76,16 @@ export function loadConfig(overrides = {}) {
     domainMaxReuse: Number(env.TH_DOMAIN_MAX_REUSE || 2),
     cfEnvchainScope: env.CF_ENVCHAIN_SCOPE || 'cf-migrate-target',
     cfKeychainDir: env.CF_KEYCHAIN_DIR || join(homedir(), 'Library', 'Keychains', 'envchain-scopes'),
+
+    // operations layer paths (local Pi integration defaults; override via env
+    // for your own setup). These are the paths read/written by supply, pool, CLI.
+    secretsDir: env.TH_SECRETS_DIR || join(homedir(), '.pi', 'agent', 'secrets'),
+    currentKeyFile: env.TH_CURRENT_KEY_FILE || join(homedir(), '.pi', 'agent', 'secrets', 'tokenharbor-current'),
+    stateDir: env.TH_STATE_DIR || join(homedir(), '.pi', 'agent', 'state'),
+    plistPath: env.TH_PLIST_PATH || join(homedir(), 'Library', 'LaunchAgents', 'com.tokenharbor.supply.plist'),
+    supplyService: env.TH_SUPPLY_SERVICE || 'com.tokenharbor.supply',
+    supplyTarget: Number(env.TH_SUPPLY_TARGET || 200),
+    supplyLowWatermark: Number(env.TH_SUPPLY_LOW_WATERMARK || 1.0),
     ...overrides,
   };
 
