@@ -1,5 +1,5 @@
 {
-  "name": "tokenharbor-register",
+  "name": "th-reg",
   "version": "0.1.0",
   "description": "Pure-HTTP registration for Token Harbor (tokenharbor.ai): no browser, no proxy required. React-19 server action replay + real mailbox verification (mandatory — API returns 403 without it).",
   "type": "module",

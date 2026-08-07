@@ -1,11 +1,11 @@
-# tokenharbor-register
+# register
 
-Pure-HTTP account registration for [Token Harbor](https://tokenharbor.ai) — no browser.
+Pure-HTTP account registration bot — no browser.
 
-Token Harbor's signup is a React 19 server action whose fields ship in the page
-HTML, so the whole flow replays with `curl` + a cookie jar. After signup the
-script verifies the email for real, claims the $5 welcome grant, enables free
-models, and creates an API key.
+The target service's signup is a React 19 server action whose fields ship in
+the page HTML, so the whole flow replays with `curl` + a cookie jar. After
+signup the script verifies the email for real, claims the welcome grant,
+enables free models, and creates an API key.
 
 ## You can't run this as-is
 
@@ -25,10 +25,10 @@ yours to provide. To produce working (verified, funded) accounts you need:
 
 Optional: DataImpulse residential proxy credentials (`--proxy sticky|rotate`).
 
-> ⚠️ **Mail verification is not optional.** Token Harbor returns
+> ⚠️ **Mail verification is not optional.** The API returns
 > `403 email_not_verified` until the verify link in the email is opened.
-> Without a real mailbox every account comes out API-locked. Supabase's
-> `email_confirmed_at` is written automatically but means nothing.
+> Without a real mailbox every account comes out API-locked. The service's
+> own auto-confirm flag is written but means nothing.
 
 ## Quick start
 
