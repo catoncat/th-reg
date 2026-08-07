@@ -69,12 +69,17 @@ export function sleep(ms) {
 
 /**
  * Mail verification provider factory.
- *   'none' (default)       -> waitVerifyLink always resolves null; relies on
- *                             Supabase auto-confirm (email_confirmed_at).
- *   'cloud-mail' (optional)-> polls a cloud-mail CLI inbox for the verify link.
+ *   'cloud-mail' (default) -> polls a mailbox CLI for the verify link.
+ *   'none'                 -> always resolves null. The account will stay
+ *                             API-locked (403 email_not_verified); only useful
+ *                             if you do not need API access at all.
  * Anything else throws so misconfiguration is loud.
+ *
+ * Contract: waitVerifyLink resolves a URL **string** or null. (Mailbox's own
+ * waitForVerifyLink returns {link, item}; unwrapping it here keeps callers
+ * from ever seeing "[object Object]" in a URL.)
  */
-export function createMailProvider(mode = 'none', { cli = 'cloud-mail' } = {}) {
+export function createMailProvider(mode = 'cloud-mail', { cli = 'cloud-mail' } = {}) {
   if (!mode || mode === 'none') {
     return {
       name: 'none',
@@ -87,7 +92,10 @@ export function createMailProvider(mode = 'none', { cli = 'cloud-mail' } = {}) {
     const mb = new Mailbox({ cli });
     return {
       name: 'cloud-mail',
-      waitVerifyLink: (email, opts) => mb.waitForVerifyLink(email, opts),
+      waitVerifyLink: async (email, opts) => {
+        const found = await mb.waitForVerifyLink(email, opts);
+        return found?.link ?? null;
+      },
     };
   }
   throw new Error(`unknown mailMode '${mode}' (expected 'none' | 'cloud-mail')`);

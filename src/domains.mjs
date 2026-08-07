@@ -59,6 +59,7 @@ function shuffle(arr, rng = Math.random) {
     const j = Math.floor(rng() * (i + 1));
     [arr[i], arr[j]] = [arr[j], arr[i]];
   }
+  return arr;
 }
 
 /**

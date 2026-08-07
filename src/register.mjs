@@ -1,6 +1,9 @@
-// Pure-protocol registration flow for tokenharbor.ai (no browser, 2026-08-06).
+// Pure-protocol registration flow for tokenharbor.ai (no browser).
 //
-// Steps (verified live):
+// This is THE primary path. The browser flow in `register-browser.mjs` is a
+// separate, opt-in alternative — never an automatic fallback.
+//
+// Steps (every one verified live against the API, 2026-08-06):
 //   1. GET /login?mode=signup with a cookie jar (on residential IPs the jar
 //      is what satisfies the Vercel Security Checkpoint; without it the POST
 //      is bounced back with the signup page)
@@ -11,9 +14,21 @@
 //   4. multipart POST with email/password/invite_code/device_fingerprint
 //      (random UUID - that's all the frontend does) /timezone -> 303 +
 //      Supabase session cookie
-//   5. poll cloud-mail for the verify link, open it over HTTP -> 307
-//      /dashboard?verify=success (no cookie needed, token self-authorizes)
-//   6. POST /api/keys -> plaintext full key; dashboard body confirms $5 gift
+//   5. POST /api/me/send-verification-email, then read the link from the
+//      mailbox and open it -> 307 /dashboard?verify=success
+//   6. POST /api/welcome/claim -> { ok, rewardUsd: 5, newTrialBalance: 5 }
+//   7. POST /api/keys -> plaintext full key
+//   8. verify the money landed by reading Supabase `wallets` (authoritative)
+//
+// HARD-WON FACTS — do not "simplify" these away:
+//   * Supabase `email_confirmed_at` is written automatically ~6s after signup
+//     but does NOT mean tokenharbor considers the address verified. The API
+//     answers 403 `email_not_verified` until the mailbox link is opened.
+//     => a real mailbox is REQUIRED for a usable account.
+//   * The $5 grant needs an explicit claim call. The dashboard HTML contains a
+//     marketing "$5" string that matches even at zero balance, which once
+//     produced 5 accounts recorded as verified/gift_claimed that were in fact
+//     unusable. Money is judged from `wallets` only.
 //
 // Proxy is OPTIONAL and off by default (`direct`). Use --proxy sticky|rotate
 // when the production batch needs per-account residential IPs.
@@ -29,8 +44,11 @@ import {
   signupPrecheck,
   postSignup,
   openVerify,
+  sendVerificationEmail,
+  claimWelcomeGrant,
   createApiKey,
-  supabaseGetUser,
+  enableFreeModels,
+  fetchWallet,
   SIGNUP_URL,
   HOST,
 } from './http.mjs';
@@ -75,7 +93,7 @@ export async function registerOne(cfg, { email, password, log = () => {} }) {
 
     // 3. submit the server action
     const r = postSignup({
-      email, password, invite: cfg.inviteCode, fp,
+      email, password, invite: cfg.inviteCode, fp, timezone: cfg.timezone,
       actionKey: page.key, actionMeta: page.meta, actionArgs: page.args,
       jar, proxy,
     });
@@ -88,63 +106,57 @@ export async function registerOne(cfg, { email, password, log = () => {} }) {
     result.status = 'created';
     log(`[+] account created (303 -> ${r.location})`);
 
-    // 4. determine email-verification. Two signals (2026-08-06):
-    //   - signups on these IPs are auto-confirmed (email_confirmed_at written
-    //     ~6s after signup) with NO verify email sent -> poll Supabase with
-    //     short retries (fast, no 150s wait)
-    //   - if Supabase stays unconfirmed, fall back to mailbox polling
-    let supaUser = null;
-    for (let i = 0; i < 4 && !supaUser?.email_confirmed_at; i++) {
-      if (i) await sleep(3000);
-      supaUser = await supabaseGetUser(email, password);
-    }
-    if (supaUser?.email_confirmed_at) {
-      result.status = 'verified';
-      result.note = 'email auto-confirmed (no verify mail)';
-      log('[+] email auto-confirmed (no verify mail needed)');
-    } else {
-      // Supabase still unconfirmed; ask the mail provider for the verify link.
-      // With mailMode=none this returns null immediately and the account is
-      // recorded created-unverified (a verified status cannot be assumed).
-      let link = null;
-      try {
-        link = await mail.waitVerifyLink(email, {
-          timeoutMs: cfg.mailTimeout * 1000,
-          intervalMs: cfg.mailPollInterval * 1000,
-          log,
-        });
-      } catch (err) {
-        result.note = `verify link lookup failed: ${err.message}`;
-        log(`[!] ${result.note}`);
-      }
-      if (link) {
-        result.verify_link = link;
-        const v = openVerify(link, { jar, proxy });
-        const ok = !!v.location?.includes('verify=success') || (/BALANCE/.test(v.body) && /Overview/.test(v.body));
-        if (ok) {
-          result.status = 'verified';
-          log(`[+] email verified -> ${v.location || 'dashboard'}`);
-        } else {
-          result.status = 'created-unverified';
-          result.note = `verify link opened but not confirmed (${v.location || 'http ' + v.code})`;
-          log(`[!] ${result.note}`);
-        }
-      } else {
-        result.status = 'created-unverified';
-        result.note = result.note || `no verify mail (mailMode=${cfg.mailMode}) and email not confirmed in Supabase`;
-        log(`[!] created-unverified: ${result.note}`);
-      }
+    // 4. verify the email for real. This is mandatory: without opening the
+    //    mailbox link the API answers 403 email_not_verified, so an account
+    //    that skips this step is worthless no matter what Supabase says.
+    if (mail.name === 'none') {
+      result.status = 'created-unverified';
+      result.note =
+        'mailMode=none: cannot verify the address, so the API stays locked ' +
+        '(403 email_not_verified). Set TH_MAIL_MODE=cloud-mail for usable accounts.';
+      log(`[!] ${result.note}`);
+      return result;
     }
 
-    // 5. post-register over HTTP: create API key + confirm $5 gift.
+    // Ask the app to send the mail (signup alone does not reliably send it).
+    const sent = sendVerificationEmail({ jar, proxy });
+    log(`[·] verification email requested (http ${sent.code})`);
+
+    let link = null;
+    try {
+      link = await mail.waitVerifyLink(email, {
+        timeoutMs: cfg.mailTimeout * 1000,
+        intervalMs: cfg.mailPollInterval * 1000,
+        log,
+      });
+    } catch (err) {
+      log(`[!] verify link lookup failed: ${err.message}`);
+    }
+    if (!link) {
+      result.status = 'created-unverified';
+      result.note = `no verify link within ${cfg.mailTimeout}s; API stays locked. Retry with scripts/recover-verify.mjs`;
+      log(`[!] ${result.note}`);
+      return result;
+    }
+
+    result.verify_link = link;
+    const v = openVerify(link, { jar, proxy });
+    if (!v.location?.includes('verify=success')) {
+      result.status = 'created-unverified';
+      result.note = `verify link did not confirm (${v.location || 'http ' + v.code})`;
+      log(`[!] ${result.note}`);
+      return result;
+    }
+    result.status = 'verified';
+    log(`[+] email verified -> ${v.location}`);
+
+    // 5. claim the $5 grant + create the API key, then prove both landed.
     //    Best-effort: failures are recorded but do not undo the account.
-    if (result.status === 'verified') {
-      try {
-        await postRegisterSetupHTTP(cfg, { jar, proxy, result, log });
-      } catch (err) {
-        result.note = [result.note, `post-register: ${err.message}`].filter(Boolean).join(' | ');
-        log(`[!] post-register partial: ${err.message}`);
-      }
+    try {
+      await postRegisterSetupHTTP(cfg, { jar, proxy, result, password, log });
+    } catch (err) {
+      result.note = [result.note, `post-register: ${err.message}`].filter(Boolean).join(' | ');
+      log(`[!] post-register partial: ${err.message}`);
     }
 
     return result;
@@ -153,8 +165,36 @@ export async function registerOne(cfg, { email, password, log = () => {} }) {
   }
 }
 
-/** Create an API key (plaintext in response) + confirm the $5 gift via dashboard body. */
-export async function postRegisterSetupHTTP(cfg, { jar, proxy, result, log }) {
+/**
+ * Claim the welcome grant, create an API key, then confirm the balance from
+ * Supabase `wallets` — the authoritative source. Never infer money from HTML.
+ */
+export async function postRegisterSetupHTTP(cfg, { jar, proxy, result, password, log }) {
+  // 1. claim the $5 welcome grant (explicit API call; nothing is automatic)
+  const cr = claimWelcomeGrant({ jar, proxy });
+  let claimed = null;
+  try {
+    claimed = JSON.parse(cr.body);
+  } catch { /* non-JSON body handled below */ }
+  if (cr.code === 200 && claimed?.ok) {
+    log(`[+] welcome grant claimed: $${claimed.rewardUsd} (trial=$${claimed.newTrialBalance})`);
+  } else {
+    const why = claimed?.error?.code || `http ${cr.code}`;
+    result.note = [result.note, `welcome claim failed: ${why}`].filter(Boolean).join(' | ');
+    log(`[!] welcome claim failed: ${why}`);
+  }
+
+  // 2. enable the free-models tier (without it every :free route answers 429
+  //    free_route_inactive). Idempotent.
+  const fr = enableFreeModels({ jar, proxy });
+  let freeEnabled = false;
+  try {
+    freeEnabled = JSON.parse(fr.body)?.free_models_enabled === true;
+  } catch { /* non-JSON */ }
+  result.free_models_enabled = freeEnabled;
+  log(freeEnabled ? '[+] free models enabled' : `[!] free models: http ${fr.code}`);
+
+  // 3. API key — the full value exists only in this response
   const kr = createApiKey({ label: 'bot-key', jar, proxy });
   if (kr.code === 200 || kr.code === 201) {
     try {
@@ -172,14 +212,21 @@ export async function postRegisterSetupHTTP(cfg, { jar, proxy, result, log }) {
     log(`[!] api/keys http ${kr.code}`);
   }
 
-  const d = httpRequest({ method: 'GET', url: `${HOST}/dashboard`, jar, proxy, timeout: 20000 });
-  if (d.code === 200) {
-    const five = d.body.match(/\$5(\.00)?/);
-    if (five) {
-      result.gift_claimed = true;
-      result.balance = five[0];
-      log('[+] $5 gift confirmed');
-    }
+  // 3. authoritative balance check (replaces the old dashboard-regex guess)
+  const wallet = await fetchWallet(result.email, password);
+  if (wallet) {
+    result.balance_trial = wallet.balanceTrial;
+    result.balance_paid = wallet.balancePaid;
+    result.gift_claimed = wallet.balanceTrial >= 5;
+    log(
+      result.gift_claimed
+        ? `[+] wallet confirms $${wallet.balanceTrial.toFixed(2)} trial credit`
+        : `[!] wallet shows only $${wallet.balanceTrial.toFixed(2)} trial credit`
+    );
+  } else {
+    result.gift_claimed = false;
+    result.note = [result.note, 'wallet read failed; balance unverified'].filter(Boolean).join(' | ');
+    log('[!] wallet read failed; not asserting any balance');
   }
 }
 

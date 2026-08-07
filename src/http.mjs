@@ -71,15 +71,6 @@ export function fetchActionPage({ jar, proxy }) {
   };
 }
 
-/** Build a multipart/form-data body; returns { boundary, body }. */
-export function buildMultipart(fields) {
-  const boundary = 'x' + randomBytes(8).toString('hex');
-  const parts = Object.entries(fields)
-    .map(([k, v]) => `--${boundary}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`)
-    .join('');
-  return { boundary, body: parts + `--${boundary}--\r\n` };
-}
-
 /** Check signup-precheck; true means Turnstile is required (we skip, never force). */
 export function signupPrecheck(fp, { proxy }) {
   const r = httpRequest({ method: 'GET', url: `https://tokenharbor.ai/api/auth/signup-precheck?fp=${encodeURIComponent(fp)}`, proxy });
@@ -91,7 +82,7 @@ export function signupPrecheck(fp, { proxy }) {
 }
 
 /** POST the signup server action. Expect 303 + Supabase session cookie in jar. */
-export function postSignup({ email, password, invite, fp, actionKey, actionMeta, actionArgs, jar, proxy }) {
+export function postSignup({ email, password, invite, fp, timezone = 'Asia/Shanghai', actionKey, actionMeta, actionArgs, jar, proxy }) {
   const entries = [
     ['$ACTION_REF_1', ''],
     ['$ACTION_1:0', actionMeta],
@@ -101,7 +92,7 @@ export function postSignup({ email, password, invite, fp, actionKey, actionMeta,
     ['password', password],
     ['invite_code', invite || ''],
     ['device_fingerprint', fp],
-    ['timezone', 'Asia/Shanghai'],
+    ['timezone', timezone],
   ];
   const b = 'x' + randomBytes(8).toString('hex');
   const body =
@@ -123,12 +114,64 @@ export function openVerify(link, { jar, proxy }) {
   return httpRequest({ method: 'GET', url: link, jar, proxy, timeout: 20000 });
 }
 
+/**
+ * Ask the app to (re)send the verification email. Reverse-engineered from the
+ * dashboard bundle: the "Verify email" button does a bare `POST` with no body.
+ * Registration does not reliably send the mail on its own, so the pure-protocol
+ * path triggers it explicitly.
+ */
+export function sendVerificationEmail({ jar, proxy }) {
+  return httpRequest({
+    method: 'POST',
+    url: `${HOST}/api/me/send-verification-email`,
+    jar,
+    proxy,
+    timeout: 20000,
+  });
+}
+
+/**
+ * List claimable rewards -> { claimable: [{ kind, level, reward }] }.
+ * `welcome_grant` is the $5 signup credit.
+ */
+export function giftsStatus({ jar, proxy }) {
+  return httpRequest({ method: 'GET', url: `${HOST}/api/gifts/status`, jar, proxy, timeout: 20000 });
+}
+
+/**
+ * Claim the $5 welcome grant (bare POST, no body — same as the dashboard).
+ * 200 -> { ok: true, rewardUsd: 5, newTrialBalance: 5 }
+ * 403 `email_not_verified` -> the mailbox link must be opened first.
+ */
+export function claimWelcomeGrant({ jar, proxy }) {
+  return httpRequest({ method: 'POST', url: `${HOST}/api/welcome/claim`, jar, proxy, timeout: 25000 });
+}
+
 /** POST /api/keys; returns parsed JSON (contains `plaintext` full key). */
 export function createApiKey({ label, jar, proxy }) {
   return httpRequest({
     method: 'POST',
     url: 'https://tokenharbor.ai/api/keys',
     data: JSON.stringify({ label }),
+    contentType: 'application/json',
+    jar,
+    proxy,
+    timeout: 20000,
+  });
+}
+
+/**
+ * Enable the free-models tier for the signed-in account (the "Enable free
+ * models?" consent on the dashboard). Without it every :free route answers
+ * 429 `free_route_inactive`. Reverse-engineered from the dashboard bundle:
+ * the consent dialog does POST /api/me/privacy { free_models_enabled: true }.
+ * Idempotent — safe to call on an account that already opted in.
+ */
+export function enableFreeModels({ jar, proxy }) {
+  return httpRequest({
+    method: 'POST',
+    url: `${HOST}/api/me/privacy`,
+    data: JSON.stringify({ free_models_enabled: true }),
     contentType: 'application/json',
     jar,
     proxy,
@@ -151,6 +194,44 @@ export async function supabaseGetUser(email, password) {
     });
     if (!res.ok) return null;
     return (await res.json())?.user || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Authoritative wallet read: password grant -> GET /rest/v1/wallets.
+ *
+ * This is the ONLY trustworthy source for "did the $5 actually land".
+ * The dashboard HTML contains a marketing "$5" string that matches even on a
+ * zero-balance account, which previously produced false `gift_claimed: true`
+ * records — never judge money from page text.
+ *
+ * @returns {Promise<{balanceTrial:number, balancePaid:number}|null>}
+ */
+export async function fetchWallet(email, password) {
+  try {
+    const grant = await fetch(`${SUPABASE_BASE}/auth/v1/token?grant_type=password`, {
+      method: 'POST',
+      headers: { apikey: SUPABASE_ANON, 'content-type': 'application/json' },
+      body: JSON.stringify({ email, password }),
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!grant.ok) return null;
+    const { access_token: token, user } = await grant.json();
+    if (!token || !user?.id) return null;
+
+    const url =
+      `${SUPABASE_BASE}/rest/v1/wallets?select=balance_trial,balance_paid&user_id=eq.${user.id}`;
+    const res = await fetch(url, {
+      headers: { apikey: SUPABASE_ANON, Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!res.ok) return null;
+    const rows = await res.json();
+    const row = Array.isArray(rows) ? rows[0] : null;
+    if (!row) return null;
+    return { balanceTrial: Number(row.balance_trial) || 0, balancePaid: Number(row.balance_paid) || 0 };
   } catch {
     return null;
   }

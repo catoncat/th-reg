@@ -45,10 +45,13 @@ export function loadConfig(overrides = {}) {
   const cfg = {
     domain: (env.TH_DOMAIN || '').replace(/^@/, ''),
     mailboxCli: env.MAILBOX_CLI || 'cloud-mail',
-    // mail verification provider. 'none' (default) relies on Supabase
-    // auto-confirm (email_confirmed_at); 'cloud-mail' also polls a mailbox
-    // CLI for the verify link as a fallback.
-    mailMode: env.MAIL_MODE || 'none',
+    // Mail verification provider. REQUIRED for a usable account: tokenharbor
+    // answers 403 email_not_verified until the mailbox link is opened, and the
+    // $5 grant cannot be claimed before that. Supabase's email_confirmed_at is
+    // set automatically but means nothing to the business logic (measured).
+    //   'cloud-mail' (default) - real inbox, produces working accounts
+    //   'none'                 - account shell only; API stays locked
+    mailMode: env.TH_MAIL_MODE || env.MAIL_MODE || 'cloud-mail',
     dip: { username, password, host, rotatePort: Number(env.DIP_ROTATE_PORT || 823) },
     dipCountry: env.DIP_COUNTRY || 'us',
     count: Number(env.TH_COUNT || 1),
@@ -58,10 +61,12 @@ export function loadConfig(overrides = {}) {
     // proxy: 'direct' (default, no proxy) | 'sticky' (per-account residential IP) | 'rotate'
     proxyMode: env.TH_PROXY_MODE || 'direct',
     timezone: env.TH_TIMEZONE || 'Asia/Shanghai',
-    signupTimeout: Number(env.TH_SIGNUP_TIMEOUT || 60),
     mailTimeout: Number(env.TH_MAIL_TIMEOUT || 150),
     mailPollInterval: Number(env.TH_MAIL_POLL_INTERVAL || 5),
     accountsFile: env.TH_ACCOUNTS_FILE || 'data/accounts.jsonl',
+    // only used by the browser engine (register-browser.mjs), which waits for
+    // the dashboard to render; the protocol engine gets a 303 synchronously.
+    signupTimeout: Number(env.TH_SIGNUP_TIMEOUT || 60),
     // domain strategy: 'dynamic' (fixed pool + auto top-up of fresh readable
     // subdomains when the batch exceeds maxReuse accounts/domain), 'pool'
     // (round-robin fixed 23-domain pool only), or 'single' (fixed TH_DOMAIN)

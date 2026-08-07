@@ -10,7 +10,6 @@
 
 import { fileURLToPath } from 'node:url';
 import { loadConfig, randomHex } from './config.mjs';
-import { registerOne } from './register.mjs';
 import { appendAccount, printAccount } from './accounts.mjs';
 import { stickyEndpoint, rotateEndpoint } from './config.mjs';
 import { generateUsername } from './names.mjs';
@@ -21,8 +20,24 @@ import { sleep } from './mailbox.mjs';
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * Engine selection is explicit and one-way: `protocol` is the product, and it
+ * never degrades into `browser` on failure. A user opts in with --engine.
+ */
+async function loadEngine(name) {
+  if (name === 'browser') {
+    const m = await import('./register-browser.mjs');
+    return { name: 'browser', registerOne: m.registerOne };
+  }
+  if (name !== 'protocol') {
+    throw new Error(`unknown --engine '${name}' (expected 'protocol' | 'browser')`);
+  }
+  const m = await import('./register.mjs');
+  return { name: 'protocol', registerOne: m.registerOne };
+}
+
 function parseArgs(argv) {
-  const o = { count: undefined, domain: undefined, delayMs: undefined, workers: undefined, inviteCode: undefined, noVerify: false, domainMode: undefined, proxyMode: undefined };
+  const o = { count: undefined, domain: undefined, delayMs: undefined, workers: undefined, inviteCode: undefined, domainMode: undefined, proxyMode: undefined, engine: 'protocol' };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const next = () => argv[++i];
@@ -33,8 +48,27 @@ function parseArgs(argv) {
     else if (a === '--workers') o.workers = Number(next());
     else if (a === '--invite-code') o.inviteCode = next();
     else if (a === '--proxy') o.proxyMode = next();
-    else if (a === '--no-verify') o.noVerify = true;
-    else if (a === '--help') { console.log('usage: node src/cli.mjs [--count N] [--domain D] [--domain-mode dynamic|pool|single] [--delay-ms MS] [--workers N] [--invite-code CODE] [--proxy direct|sticky|rotate] [--no-verify]'); process.exit(0); }
+    else if (a === '--engine') o.engine = next();
+    else if (a === '--help') {
+      console.log(`usage: node src/cli.mjs [options]
+
+  --count N                       accounts to create (default 1)
+  --workers N                     parallel workers
+  --domain D                      single catch-all domain
+  --domain-mode dynamic|pool|single
+  --delay-ms MS                   pause between accounts
+  --invite-code CODE              referral code
+  --proxy direct|sticky|rotate    network mode (default direct)
+  --engine protocol|browser       registration engine (default protocol)
+
+Engines are independent paths; 'protocol' never falls back to 'browser'.
+  protocol  pure HTTP, no browser (the product)
+  browser   agent-browser/CDP click-path, opt-in alternative
+
+A real mailbox is required either way: the API returns 403 email_not_verified
+until the verification link is opened, so TH_MAIL_MODE must not be 'none'.`);
+      process.exit(0);
+    }
   }
   return o;
 }
@@ -60,6 +94,20 @@ async function main() {
     ...(o.proxyMode !== undefined ? { proxyMode: o.proxyMode } : {}),
   });
 
+  const engine = await loadEngine(o.engine);
+
+  // Guard rail: without a real mailbox every account comes out API-locked
+  // (403 email_not_verified) and cannot claim its $5. Fail fast instead of
+  // burning domains and invite credit on unusable shells.
+  if (cfg.mailMode === 'none') {
+    console.error(
+      "[fatal] TH_MAIL_MODE=none cannot produce usable accounts: the API stays locked\n" +
+      "        at 403 email_not_verified and the $5 grant cannot be claimed.\n" +
+      "        Set TH_MAIL_MODE=cloud-mail (or another real inbox provider)."
+    );
+    process.exit(2);
+  }
+
   // domain allocator: dynamic (default) -> pool -> single
   let cfEnv = null;
   if (cfg.domainMode === 'dynamic') {
@@ -78,7 +126,7 @@ async function main() {
     log: (m) => console.log(`  ${m}`),
   });
 
-  console.log(`[config] domain-mode=${allocator.mode} count=${cfg.count} workers=${cfg.workers} delay=${cfg.delayMs}ms maxReuse=${cfg.domainMaxReuse} proxy=${cfg.proxyMode}`);
+  console.log(`[config] engine=${engine.name} domain-mode=${allocator.mode} count=${cfg.count} workers=${cfg.workers} delay=${cfg.delayMs}ms maxReuse=${cfg.domainMaxReuse} proxy=${cfg.proxyMode} mail=${cfg.mailMode}`);
   if (cfg.proxyMode === 'direct') {
     console.log('[proxy] direct (no proxy)');
   } else {
@@ -89,7 +137,8 @@ async function main() {
   // prepare the domain pool (pull historical dynamic domains + top-up if needed)
   await allocator.init();
 
-  const created = { created: 0, verified: 0, failed: 0 };
+  // `usable` is the only number that matters: verified + key + funded.
+  const created = { created: 0, verified: 0, usable: 0, failed: 0 };
   const usedNames = new Set();
   const queue = Array.from({ length: cfg.count }, () => ({
     username: generateUsername(usedNames),
@@ -102,14 +151,16 @@ async function main() {
     try {
       const domain = await allocator.next();
       email = `${job.username}@${domain}`;
-      const r = await registerOne(cfg, { email, password: job.password, log: (m) => console.log(`  ${m}`) });
+      const r = await engine.registerOne(cfg, { email, password: job.password, log: (m) => console.log(`  ${m}`) });
       r.password = job.password;
       appendAccount(cfg.accountsFile, r);
       printAccount(r);
       if (r.status === 'verified') created.verified++;
+      if (r.status === 'verified' && r.api_key && r.gift_claimed) created.usable++;
       if (r.status === 'created' || r.status === 'verified' || r.status === 'created-unverified') created.created++;
       if (r.status === 'failed' || r.status === 'captcha-required') created.failed++;
-      console.log(`[done] ${email} status=${r.status} (${((Date.now() - t0) / 1000).toFixed(1)}s)`);
+      const money = r.balance_trial !== undefined ? ` trial=$${Number(r.balance_trial).toFixed(2)}` : '';
+      console.log(`[done] ${email} status=${r.status}${money}${r.api_key ? ' key=yes' : ''} (${((Date.now() - t0) / 1000).toFixed(1)}s)`);
     } catch (err) {
       created.failed++;
       const rec = { email: email || `${job.username}@<no-domain>`, status: 'failed', error: String(err.message || err).slice(0, 300), created_at: new Date().toISOString() };
@@ -135,7 +186,12 @@ async function main() {
     }
   }
 
-  console.log(`\n[summary] created=${created.created} verified=${created.verified} failed=${created.failed} -> ${cfg.accountsFile}`);
+  console.log(
+    `\n[summary] usable=${created.usable} (verified+key+funded) | created=${created.created} verified=${created.verified} failed=${created.failed} -> ${cfg.accountsFile}`
+  );
+  if (created.usable < created.created) {
+    console.log('[note] accounts short of "usable" are missing verification, a key, or the $5 grant.');
+  }
 }
 
 main().catch((err) => {
