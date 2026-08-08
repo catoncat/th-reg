@@ -588,78 +588,139 @@ function stackBar(parts, width, c) {
  * burn (continuous) and fill (lumpy +$5 grants) have different natural
  * magnitudes, so each gets its own vertical scale; the shared axis is time.
  */
-function dualChart(series, width, height, c) {
-  const w = Math.max(8, width);
+/**
+ * Burn history as a single tall braille chart over a real time axis.
+ *
+ * Design notes learned the hard way:
+ *  - The window must match the data we actually have, or the axis lies.
+ *  - Splitting into two 1-row lanes produced scatter, not lines; burn gets
+ *    the full height and fill is drawn as event ticks along the baseline.
+ */
+function burnChart(series, width, height, c) {
+  const w = Math.max(12, width);
+  const h = Math.max(2, height);
   const cells = w * 2;
-  const win = series.window(cells);
+
+  // Only chart the span we have data for; never paint an empty past.
+  const all = series.all();
+  const withData = all.filter((b) => b.burn > 0 || b.fill > 0 || b.req > 0);
+  if (!withData.length) {
+    return [c(ansi.dim, 'no traffic observed yet')];
+  }
+  const oldest = withData[0].t;
+  const nowBin = Math.floor(Date.now() / series.binMs) * series.binMs;
+  const haveBins = Math.max(1, Math.round((nowBin - oldest) / series.binMs) + 1);
+  const useBins = Math.min(cells, haveBins);
+
+  const win = series.window(useBins);
   const perMin = 60_000 / series.binMs;
-  const burnVals = win.map((b) => b.burn * perMin);
-  const fillVals = win.map((b) => b.fill * perMin);
 
-  const laneH = Math.max(1, Math.floor((Math.max(2, height) - 1) / 2));
+  // Resample onto the pixel grid so the drawing always spans the full width.
+  const burnRaw = new Array(cells).fill(0);
+  const fill = new Array(cells).fill(0);
+  for (let i = 0; i < cells; i++) {
+    const src = Math.min(win.length - 1, Math.floor((i / cells) * win.length));
+    burnRaw[i] = win[src].burn * perMin;
+    fill[i] = win[src].fill * perMin;
+  }
 
-  const lane = (vals, name, color) => {
-    const peak = Math.max(...vals, 0.0001);
-    const dotRows = laneH * 4;
-    const grid = Array.from({ length: laneH }, () => new Array(w).fill(0));
-    for (let i = 0; i < cells; i++) {
-      const v = vals[i] || 0;
-      if (v <= 0) continue;
-      const level = Math.min(dotRows - 1, Math.round((v / peak) * (dotRows - 1)));
-      const col = Math.floor(i / 2);
-      const half = i % 2;
-      const row = laneH - 1 - Math.floor(level / 4);
-      const dotIdx = level % 4;
-      const bits = half === 0 ? [0x40, 0x04, 0x02, 0x01] : [0x80, 0x20, 0x10, 0x08];
-      grid[row][col] |= bits[3 - dotIdx];
-    }
-    const lines = [];
-    for (let r = 0; r < laneH; r++) {
-      let body = '';
-      for (let x = 0; x < w; x++) {
-        const mask = grid[r][x];
-        body += mask ? String.fromCharCode(0x2800 + mask) : ' ';
-      }
-      let line = c(color, body);
-      if (r === 0) {
-        const hasData = vals.some((v) => v > 0);
-        line += c(ansi.dim, '  ' + (hasData ? moneyFine(peak) + '/m' : '—'));
-      }
-      lines.push(line);
-    }
-    return lines.map((l, i) =>
-      c(ansi.dim, (i === lines.length - 1 ? name : '').padEnd(5)) + l,
+  // Carry the last known value across empty bins: a gap means "no request
+  // landed in this 6s slot", not "spend dropped to zero".
+  let carry = 0;
+  for (let i = 0; i < cells; i++) {
+    if (burnRaw[i] > 0) carry = burnRaw[i];
+    else burnRaw[i] = carry;
+  }
+
+  // Requests land on bin boundaries unevenly, so a steady spend renders as a
+  // sawtooth. Smooth the burn line; the shape is the signal, not the binning.
+  const smoothW = Math.max(2, Math.round(cells / 40));
+  const burn = burnRaw.map((_, i) => {
+    const lo = Math.max(0, i - smoothW);
+    const hi = Math.min(burnRaw.length - 1, i + smoothW);
+    let sum = 0;
+    for (let k = lo; k <= hi; k++) sum += burnRaw[k];
+    return sum / (hi - lo + 1);
+  });
+
+  // Scale to the observed band, not 0..peak: a line hovering at $18 with a
+  // lone $29 spike would otherwise sit in the middle with dead space above
+  // and below. Keep zero visible only when the data actually approaches it.
+  const vmax = Math.max(...burn, 0.0001);
+  const vmin = Math.min(...burn);
+  const nearZero = vmin < vmax * 0.25;
+  const lo = nearZero ? 0 : vmin - (vmax - vmin) * 0.15;
+  const hi = vmax + (vmax - lo) * 0.05;
+  const range = Math.max(hi - lo, 0.0001);
+  const dotRows = h * 4;
+  const grid = Array.from({ length: h }, () => new Array(w).fill(0));
+
+  for (let i = 0; i < cells; i++) {
+    const v = burn[i];
+    if (v <= 0) continue;
+    const level = Math.min(
+      dotRows - 1,
+      Math.max(0, Math.round(((v - lo) / range) * (dotRows - 1))),
     );
-  };
+    const col = Math.floor(i / 2);
+    const half = i % 2;
+    const row = h - 1 - Math.floor(level / 4);
+    const dotIdx = level % 4;
+    const bits = half === 0 ? [0x40, 0x04, 0x02, 0x01] : [0x80, 0x20, 0x10, 0x08];
+    grid[row][col] |= bits[3 - dotIdx];
+  }
 
-  const out = [];
-  for (const l of lane(burnVals, 'burn', ansi.red)) out.push(l);
-  for (const l of lane(fillVals, 'fill', ansi.green)) out.push(l);
+  const lines = [];
+  for (let r = 0; r < h; r++) {
+    let body = '';
+    for (let x = 0; x < w; x++) {
+      const mask = grid[r][x];
+      body += mask ? String.fromCharCode(0x2800 + mask) : ' ';
+    }
+    let line = c(ansi.red, body);
+    if (r === 0) line += c(ansi.dim, '  ' + moneyFine(hi) + '/m');
+    else if (r === h - 1) line += c(ansi.dim, '  ' + moneyFine(Math.max(0, lo)) + '/m');
+    lines.push(line);
+  }
 
-  const spanMin = series.spanMin(cells);
-  const ticks = Math.max(2, Math.min(5, Math.floor(w / 14)));
-  let axisLine = '';
+  // Fill events as ticks on the baseline: lumpy grants, not a continuous rate.
+  let ticks = '';
+  let anyFill = false;
+  for (let x = 0; x < w; x++) {
+    const a = fill[x * 2] || 0;
+    const b = fill[x * 2 + 1] || 0;
+    if (a > 0 || b > 0) {
+      ticks += '▲';
+      anyFill = true;
+    } else ticks += ' ';
+  }
+  if (anyFill) lines.push(c(ansi.green, ticks) + c(ansi.dim, '  +$5 grants'));
+
+  // Axis reflects the real span of the data on screen.
+  const spanMin = (useBins * series.binMs) / 60_000;
+  const ticksN = Math.max(2, Math.min(5, Math.floor(w / 14)));
+  let axis = '';
   let cursor = 0;
-  for (let i = 0; i < ticks; i++) {
-    const frac = i / (ticks - 1);
+  for (let i = 0; i < ticksN; i++) {
+    const frac = i / (ticksN - 1);
     const pos = Math.round(frac * (w - 1));
-    const minsAgo = spanMin * (1 - frac);
+    const mins = spanMin * (1 - frac);
     const label =
-      i === ticks - 1
+      i === ticksN - 1
         ? 'now'
-        : '-' + (minsAgo >= 1 ? Math.round(minsAgo) + 'm' : Math.round(minsAgo * 60) + 's');
+        : '-' + (mins >= 1 ? Math.round(mins) + 'm' : Math.round(mins * 60) + 's');
     const target = Math.min(pos, w - label.length);
     if (target > cursor) {
-      axisLine += ' '.repeat(target - cursor);
+      axis += ' '.repeat(target - cursor);
       cursor = target;
     }
     if (cursor <= w - label.length) {
-      axisLine += label;
+      axis += label;
       cursor += label.length;
     }
   }
-  out.push(c(ansi.dim, ' '.repeat(5) + axisLine));
-  return out;
+  lines.push(c(ansi.dim, axis));
+  return lines;
 }
 
 function classify({ health, ld, supply, rates }) {
@@ -841,16 +902,11 @@ function renderGlance(ctx) {
     );
     add('');
 
-    // ── 3 TIME: the axis this panel was missing ────────────
+    // ── 3 TIME ─────────────────────────────────────────────
     if (series) {
-      const chartH = W >= 80 ? 4 : 3;
-      const chartW = Math.max(20, W - 14);
-      const observed = series.all().some((b) => b.burn > 0 || b.fill > 0);
-      add(
-        c(ansi.dim, 'burn / fill over time') +
-          (observed ? '' : c(ansi.dim, '   collecting — needs ~1 min of traffic')),
-      );
-      for (const line of dualChart(series, chartW, chartH, c)) add(line);
+      add(c(ansi.dim, 'burn over time'));
+      const chartH = rows >= 34 ? 6 : rows >= 28 ? 5 : 4;
+      for (const line of burnChart(series, W - 2, chartH, c)) add('  ' + line);
       add('');
     }
 
@@ -1072,4 +1128,5 @@ export async function runWatch(opts = {}) {
     restore();
   }
 }
+
 
