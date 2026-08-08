@@ -246,6 +246,41 @@ function parseSupplyLog(text) {
   };
 }
 
+
+/** Tail gateway.log for spend/exhaust facts (mixed RECENT feed). */
+function parseGatewayLog(text) {
+  const recent = [];
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    let m = line.match(/\(([^)]+@[^)]+)\) -> 200.*?soft−\$?([\d.]+).*?book=\$?([\d.]+)/);
+    if (!m) m = line.match(/\(([^)]+@[^)]+)\) -> 200\s+−\$([\d.]+)\s+bal=\$([\d.]+)/);
+    if (m) {
+      recent.push({
+        kind: 'spend',
+        email: m[1],
+        text: '−$' + Number(m[2]).toFixed(2),
+        amount: Number(m[2]),
+      });
+      continue;
+    }
+    m = line.match(/\(([^)]+@[^)]+)\) -> (?:402|403).*\(balance\)/);
+    if (m) {
+      recent.push({ kind: 'exhaust', email: m[1], text: 'exhausted' });
+      continue;
+    }
+    m = line.match(/pool exhausted/);
+    if (m) {
+      recent.push({ kind: 'empty', text: 'pool exhausted' });
+    }
+  }
+  if (recent.length > 80) return recent.slice(-80);
+  return recent;
+}
+
+function gatewayLogPath() {
+  return process.env.TH_GATEWAY_LOG || join(PROJECT_ROOT, 'data', 'gateway.log');
+}
+
 function createRateTracker() {
   const samples = [];
   return {
@@ -255,8 +290,9 @@ function createRateTracker() {
       const cut = t - 180_000;
       while (samples.length > 2 && samples[0].t < cut) samples.shift();
     },
-    netPerMin() {
-      if (samples.length < 2) return null;
+    /** @returns {{ net: number|null, burn: number|null, fill: number|null, dtMin: number|null }} */
+    rates() {
+      if (samples.length < 2) return { net: null, burn: null, fill: null, dtMin: null };
       const last = samples[samples.length - 1];
       let i = 0;
       for (let k = 0; k < samples.length; k++) {
@@ -264,10 +300,27 @@ function createRateTracker() {
       }
       const first = samples[i];
       const dtMin = (last.t - first.t) / 60_000;
-      if (dtMin < 0.25) return null;
-      return (last.bal - first.bal) / dtMin;
+      if (dtMin < 0.25) return { net: null, burn: null, fill: null, dtMin };
+      let up = 0;
+      let down = 0;
+      for (let k = i; k < samples.length - 1; k++) {
+        const d = samples[k + 1].bal - samples[k].bal;
+        if (d > 0) up += d;
+        else if (d < 0) down += -d;
+      }
+      return {
+        net: (last.bal - first.bal) / dtMin,
+        burn: down / dtMin,
+        fill: up / dtMin,
+        dtMin,
+      };
     },
-    samples() { return samples.slice(); },
+    netPerMin() {
+      return this.rates().net;
+    },
+    samples() {
+      return samples.slice();
+    },
   };
 }
 
@@ -313,6 +366,17 @@ function money(n) {
   );
 }
 
+/** Hero book balance with cents — integer $ hid soft-debit movement. */
+function moneyBook(n) {
+  if (n == null || Number.isNaN(n)) return '$—';
+  const sign = n < 0 ? '-' : '';
+  return (
+    sign +
+    '$' +
+    Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  );
+}
+
 function moneyFine(n) {
   if (n == null || Number.isNaN(n)) return '$—';
   const sign = n < 0 ? '-' : '';
@@ -343,71 +407,138 @@ function ageSec(at) {
   return (Date.now() - at) / 1000;
 }
 
-function classify({ health, ld, supply }) {
+
+/**
+ * Pool ops moods — burn vs fill first, supply second.
+ * EMPTY | STALLED | DRAINING | REFILLING | RECOVERING | BALANCED | HEALTHY | DOWN
+ */
+function classify({ health, ld, supply, rates }) {
   if (!health.ok) return 'DOWN';
   const bal = health.totalBalance;
   const active = health.activeKeys;
   const target = ld.targetUsd || 1000;
   const running = ld.running;
   const fails = supply.failStreak || 0;
+  const net = rates?.net;
+  const burn = rates?.burn ?? 0;
+  const fill = rates?.fill ?? 0;
+
   if (active === 0 && bal < 0.5) return 'EMPTY';
   if (running && fails >= 4) return 'STALLED';
-  if (bal >= target && active > 0) return 'HEALTHY';
   if (active > 0 && bal < target * 0.05 && running) return 'RECOVERING';
+  if (running && bal < target) return 'REFILLING';
+  // Draining: burning with little/no fill, or deep below target while supply idle
+  if (
+    (net != null && net < -1 && fill < burn * 0.4) ||
+    (bal < target && !running && net != null && net < -0.2)
+  ) {
+    return 'DRAINING';
+  }
+  if (bal >= target && active > 0) {
+    if (net != null && Math.abs(net) < 2 && burn > 0.5) return 'BALANCED';
+    if (!running || (supply.targetGap != null && supply.targetGap <= 0)) return 'HEALTHY';
+    return 'BALANCED';
+  }
   if (running || bal < target) return 'REFILLING';
   return 'HEALTHY';
 }
 
-function conclusion({ mood, health, ld, supply, netPerMin }) {
+function conclusion({ mood, health, ld, supply, rates }) {
   const target = ld.targetUsd || 1000;
   const bal = health.ok ? health.totalBalance : 0;
-  const net = netPerMin;
+  const net = rates?.net;
+  const burn = rates?.burn;
+  const fill = rates?.fill;
+
   const netStr =
     net == null
       ? null
-      : (net >= 0 ? 'net +' : 'net ') + moneyFine(net).replace('$-', '−$') + '/min';
+      : (net >= 0 ? 'net +' : 'net ') + moneyFine(net).replace('$-', '-') + '/min';
 
-  if (mood === 'DOWN') return { title: 'GATEWAY DOWN', sub: health.error || 'unreachable', color: ansi.red };
-  if (mood === 'EMPTY')
+  if (mood === 'DOWN') {
+    return { title: 'GATEWAY DOWN', sub: health.error || 'unreachable', color: ansi.red };
+  }
+  if (mood === 'EMPTY') {
     return {
       title: 'EMPTY · requests will 503',
-      sub: ld.running ? 'supply engaged · first live key ~60–90s' : 'supply not running · kick com.tokenharbor.supply',
+      sub: ld.running
+        ? 'supply engaged · first live key ~60–90s'
+        : 'supply not running · kick com.tokenharbor.supply',
       color: ansi.red,
     };
-  if (mood === 'STALLED')
+  }
+  if (mood === 'STALLED') {
     return {
       title: 'STALLED · supply failing',
       sub: 'fail streak ' + supply.failStreak + ' · captcha/proxy/mail?',
       color: ansi.red,
     };
-  if (mood === 'HEALTHY')
+  }
+  if (mood === 'DRAINING') {
+    const parts = ['DRAINING'];
+    if (netStr) parts.push(netStr);
+    if (net != null && net < -0.05 && bal > 0) {
+      parts.push('503 risk in ' + fmtDur((bal / Math.abs(net)) * 60));
+    }
     return {
-      title: 'HEALTHY · ' + money(bal) + ' book · ' + health.activeKeys + ' live',
-      sub: ld.running ? 'above target · supply still winding down' : 'above target · supply idle',
-      color: ansi.green,
+      title: parts.join(' · '),
+      sub: [
+        burn != null ? 'burn ' + moneyFine(burn) + '/min' : null,
+        fill != null && fill > 0 ? 'fill ' + moneyFine(fill) + '/min' : 'fill idle',
+        !ld.running ? 'supply idle' : null,
+      ]
+        .filter(Boolean)
+        .join(' · '),
+      color: ansi.yellow,
     };
-  if (mood === 'RECOVERING')
+  }
+  if (mood === 'RECOVERING') {
     return {
-      title: 'RECOVERING · ' + money(bal) + ' book · ' + health.activeKeys + ' live',
+      title: 'RECOVERING · ' + moneyBook(bal) + ' book · ' + health.activeKeys + ' live',
       sub: netStr ? netStr + ' · climbing out of empty' : 'supply engaged · climbing out of empty',
       color: ansi.yellow,
     };
-
-  const parts = ['REFILLING'];
-  if (netStr) parts.push(netStr);
-  if (net != null && net > 0.05 && bal < target) parts.push('clear in ' + fmtDur(((target - bal) / net) * 60));
-  else if (bal < target) parts.push(money(target - bal) + ' below target');
-
+  }
+  if (mood === 'REFILLING') {
+    const parts = ['REFILLING'];
+    if (netStr) parts.push(netStr);
+    if (net != null && net > 0.05 && bal < target) {
+      parts.push('clear in ' + fmtDur(((target - bal) / net) * 60));
+    } else if (bal < target) {
+      parts.push(moneyBook(target - bal) + ' below target');
+    }
+    return {
+      title: parts.join(' · '),
+      sub: [
+        supply.added != null ? '+' + supply.added + ' this run' : null,
+        health.activeKeys + ' live',
+        burn != null && burn > 0.05 ? 'burn ' + moneyFine(burn) + '/min' : null,
+      ]
+        .filter(Boolean)
+        .join(' · '),
+      color: ansi.yellow,
+    };
+  }
+  if (mood === 'BALANCED') {
+    return {
+      title: 'BALANCED · ' + (netStr || 'steady') + ' · ' + moneyBook(bal) + ' book',
+      sub:
+        (burn != null ? 'burn ' + moneyFine(burn) + '/min' : 'burn —') +
+        ' · ' +
+        (fill != null ? 'fill ' + moneyFine(fill) + '/min' : 'fill —') +
+        ' · ' +
+        health.activeKeys +
+        ' live',
+      color: ansi.green,
+    };
+  }
+  // HEALTHY
   return {
-    title: parts.join(' · '),
-    sub: [
-      ld.running ? null : 'supply not running',
-      supply.added != null ? '+' + supply.added + ' this run' : null,
-      health.activeKeys + ' live',
-    ]
-      .filter(Boolean)
-      .join(' · '),
-    color: ansi.yellow,
+    title: 'HEALTHY · ' + moneyBook(bal) + ' book · ' + health.activeKeys + ' live',
+    sub: ld.running
+      ? 'above target · supply winding down'
+      : 'above target · supply idle',
+    color: ansi.green,
   };
 }
 
@@ -425,29 +556,49 @@ function stageLabel(stage) {
   return map[stage] || (stage + '       ').slice(0, 7);
 }
 
-function hr(cols, colorize) {
-  return colorize(ansi.gray, '─'.repeat(Math.max(8, cols)));
+function rateBar(value, maxRef, width, colorize, color) {
+  const max = Math.max(maxRef, 0.01);
+  const pct = Math.max(0, Math.min(1, (value || 0) / max));
+  const filled = Math.round(pct * width);
+  return colorize(color, '='.repeat(filled)) + colorize(ansi.gray, '-'.repeat(Math.max(0, width - filled)));
 }
 
 function renderGlance(ctx) {
-  const { health, ld, supply, netPerMin, now, cols, rows, rateSamples } = ctx;
+  const {
+    health,
+    ld,
+    supply,
+    rates,
+    netPerMin,
+    now,
+    cols,
+    rows,
+    rateSamples,
+    sessionStartBal,
+    gatewayRecent,
+  } = ctx;
   const tty = ctx.tty;
   const c = (code, s) => paint(tty, code, s);
-  const mood = classify(ctx);
-  const head = conclusion({ ...ctx, mood });
+  const mood = classify({ ...ctx, rates: rates || { net: netPerMin } });
+  const head = conclusion({
+    ...ctx,
+    mood,
+    rates: rates || { net: netPerMin },
+  });
   const target = ld.targetUsd || 1000;
   const bal = health.ok ? health.totalBalance : 0;
   const pct = target > 0 ? bal / target : 0;
+  const burn = rates?.burn ?? null;
+  const fill = rates?.fill ?? null;
+  const net = rates?.net ?? netPerMin;
 
-  // Content width = full terminal minus small gutter
   const gutter = 2;
   const W = Math.max(40, cols - gutter * 2);
   const pad = (s) => ' '.repeat(gutter) + s;
-
   const out = [];
   const add = (s = '') => out.push(s.length ? pad(s) : '');
 
-  // ── header ───────────────────────────────────────────────
+  // ── 1. conclusion ─────────────────────────────────────────
   add('');
   add(c(ansi.bold, c(head.color, head.title)));
   if (head.sub) add(c(ansi.dim, head.sub));
@@ -456,125 +607,182 @@ function renderGlance(ctx) {
   if (mood === 'DOWN') {
     add(c(ansi.dim, 'is gateway up?  launchctl kickstart gui/$(id -u)/com.tokenharbor.gateway'));
   } else {
-    // ── hero balance (uses full width) ─────────────────────
-    const balColor = mood === 'EMPTY' ? ansi.red : mood === 'HEALTHY' ? ansi.green : ansi.bold;
-    const left = money(bal) + ' book';
+    // ── 2. dual track burn | fill ───────────────────────────
+    const ref = Math.max(burn || 0, fill || 0, Math.abs(net || 0), 1);
+    const trackW = Math.max(12, W - 28);
+    add(c(ansi.dim, 'DEMAND / SUPPLY'));
+    {
+      const b = burn == null ? null : burn;
+      const label = 'burn  ';
+      const val = b == null ? '  …/min' : ('−' + moneyFine(b) + '/min').padEnd(14);
+      add(
+        c(ansi.red, label) +
+          c(ansi.dim, val) +
+          rateBar(b || 0, ref, trackW, c, ansi.red),
+      );
+    }
+    {
+      const f = fill == null ? null : fill;
+      const label = 'fill  ';
+      const val = f == null ? '  …/min' : ('+' + moneyFine(f) + '/min').padEnd(14);
+      add(
+        c(ansi.green, label) +
+          c(ansi.dim, val) +
+          rateBar(f || 0, ref, trackW, c, ansi.green),
+      );
+    }
+    {
+      let session = '';
+      if (sessionStartBal != null && Number.isFinite(sessionStartBal)) {
+        const d = bal - sessionStartBal;
+        if (Math.abs(d) >= 0.005) {
+          session = 'session ' + (d >= 0 ? '+' : '') + moneyBook(d);
+        }
+      }
+      const netTxt =
+        net == null ? 'net …' : 'net ' + (net >= 0 ? '+' : '') + moneyFine(net) + '/min';
+      add(c(ansi.dim, netTxt + (session ? '  ·  ' + session : '')));
+    }
+    add('');
+
+    // ── 3. pool book ────────────────────────────────────────
+    add(c(ansi.dim, 'POOL'));
+    const balColor =
+      mood === 'EMPTY' ? ansi.red : mood === 'HEALTHY' || mood === 'BALANCED' ? ansi.green : ansi.bold;
+    const left = moneyBook(bal) + ' book';
     const right = 'target ' + money(target);
     const mid = Math.max(2, W - stripAnsi(left).length - stripAnsi(right).length);
     add(c(balColor, left) + ' '.repeat(mid) + c(ansi.dim, right));
-
-    // progress track = full content width
     const barColor =
-      mood === 'EMPTY' ? ansi.red : mood === 'HEALTHY' ? ansi.green : ansi.yellow;
+      mood === 'EMPTY'
+        ? ansi.red
+        : mood === 'HEALTHY' || mood === 'BALANCED'
+          ? ansi.green
+          : ansi.yellow;
     add(bar(pct, W, c, barColor));
-
-    // pct + counts on one full-width row
-    const pctStr = Math.round(pct * 100) + '%';
     let meta =
-      pctStr +
-      '  ·  ' +
+      Math.round(pct * 100) +
+      '%  ·  ' +
       health.activeKeys +
       ' live  ·  ' +
       health.exhaustedKeys +
-      ' exhausted  ·  ' +
+      ' empty  ·  ' +
+      (health.usedKeys != null ? health.usedKeys + ' used  ·  ' : '') +
       health.totalKeys +
       ' keys';
-    if (netPerMin != null && netPerMin < -0.05 && bal > 0) {
-      meta += '  ·  headroom ' + fmtDur((bal / Math.abs(netPerMin)) * 60);
-    }
     add(c(ansi.dim, meta));
     add('');
 
-    // ── workers (full width columns) ───────────────────────
-    add(c(ansi.dim, 'WORKERS'));
-    const ws = supply.workers || [];
-    if (ld.running && ws.length) {
-      for (const w of ws) {
-        const age = ageSec(w.at);
-        const ageStr = w.stage === 'done' ? w.detail || '+$5' : age != null ? fmtAge(age) : '';
-        const stageColor =
-          w.stage === 'done'
-            ? ansi.green
-            : w.stage === 'fail'
-              ? ansi.red
-              : w.stage === 'opening'
-                ? ansi.yellow
-                : null;
-        const leftW =
-          c(ansi.dim, 'w' + w.id) + '  ' + c(stageColor, stageLabel(w.stage));
-        const emailBudget = Math.max(12, W - stripAnsi(leftW).length - 8);
-        const email = truncEmail(w.email || (w.stage === 'signup' ? '…' : '…'), emailBudget);
-        const row =
-          leftW +
-          '  ' +
-          email +
-          ' '.repeat(Math.max(1, W - stripAnsi(leftW).length - 2 - stripAnsi(email).length - String(ageStr).length)) +
-          c(ansi.dim, String(ageStr));
-        add(row);
+    // ── 4. supply workers (collapse when idle) ──────────────
+    if (ld.running) {
+      add(c(ansi.dim, 'SUPPLY'));
+      const ws = supply.workers || [];
+      if (ws.length) {
+        for (const wk of ws) {
+          const age = ageSec(wk.at);
+          const ageStr =
+            wk.stage === 'done' ? wk.detail || '+$5' : age != null ? fmtAge(age) : '';
+          const stageColor =
+            wk.stage === 'done'
+              ? ansi.green
+              : wk.stage === 'fail'
+                ? ansi.red
+                : wk.stage === 'opening'
+                  ? ansi.yellow
+                  : null;
+          const leftW = c(ansi.dim, 'w' + wk.id) + '  ' + c(stageColor, stageLabel(wk.stage));
+          const emailBudget = Math.max(12, W - stripAnsi(leftW).length - 8);
+          const email = truncEmail(
+            wk.email || (wk.stage === 'signup' ? '…' : '…'),
+            emailBudget,
+          );
+          const row =
+            leftW +
+            '  ' +
+            email +
+            ' '.repeat(
+              Math.max(
+                1,
+                W - stripAnsi(leftW).length - 2 - stripAnsi(email).length - String(ageStr).length,
+              ),
+            ) +
+            c(ansi.dim, String(ageStr));
+          add(row);
+        }
+      } else {
+        add(c(ansi.dim, 'workers starting…'));
       }
-    } else if (ld.running) {
-      add(c(ansi.dim, 'starting…'));
+      const footBits = [];
+      if (supply.added != null) footBits.push('+' + supply.added + ' this run');
+      if (supply.maxAdds != null && supply.added != null) {
+        footBits.push(supply.added + '/' + supply.maxAdds);
+      }
+      if (supply.failStreak) footBits.push('fail ' + supply.failStreak);
+      if (ld.pid) footBits.push('pid ' + ld.pid);
+      if (footBits.length) add(c(ansi.dim, footBits.join('  ·  ')));
+      add('');
     } else {
-      add(c(ansi.dim, 'idle'));
-    }
-    add('');
-
-    // ── rate sparkline when we have samples ───────────────
-    if (rateSamples && rateSamples.length >= 2) {
-      add(c(ansi.dim, 'BALANCE (session)'));
-      const net = netPerMin;
-      const netTxt =
-        net == null ? '' : '  ' + (net >= 0 ? '+' : '') + moneyFine(net) + '/min';
-      add(sparkline(rateSamples, W - stripAnsi(netTxt).length, c) + c(ansi.dim, netTxt));
+      add(
+        c(ansi.dim, 'SUPPLY') +
+          '  ' +
+          c(ansi.dim, ld.loaded ? 'idle · next tick ≤60s' : 'not loaded'),
+      );
       add('');
     }
-
-    // ── recent feed: CONSUMES remaining rows ──────────────
-    // Compute how many lines we can still place before footer.
-    // We'll finalize after building fixed sections; see below.
   }
 
-  // evidence strip
-  const footBits = [];
-  if (supply.added != null) footBits.push('+' + supply.added + ' this run');
-  if (supply.maxAdds != null && supply.added != null) footBits.push(supply.added + '/' + supply.maxAdds);
-  if (supply.failStreak) footBits.push('fail ' + supply.failStreak);
-  if (ld.running && ld.pid) footBits.push('pid ' + ld.pid);
-  else if (!ld.running) footBits.push(ld.loaded ? 'supply idle' : 'supply not loaded');
-  if (health.ok && health.ledgerSeq != null) footBits.push('ledger #' + health.ledgerSeq);
-  if (health.ok && health.ms != null) footBits.push(health.ms + 'ms');
-  if (mood !== 'DOWN') add(c(ansi.dim, footBits.join('  ·  ')));
-
-  // Fill leftover viewport with RECENT activity
+  // ── 5. RECENT fills leftover ──────────────────────────────
   const footerReserve = 1;
   const used = out.length;
   const leftover = Math.max(0, rows - footerReserve - used);
   if (mood !== 'DOWN' && leftover >= 3) {
-    add('');
     add(c(ansi.dim, 'RECENT'));
-    const feedBudget = Math.max(1, leftover - 2); // header + blank eaten
-    const events = (supply.recent || []).slice().reverse(); // newest first
-    const show = events.slice(0, feedBudget);
+    const feedBudget = Math.max(1, leftover - 1);
+    // merge supply recent + gateway recent, newest last in sources → reverse for display
+    const merged = [];
+    for (const ev of supply.recent || []) {
+      merged.push({ ...ev, _src: 'supply' });
+    }
+    for (const ev of gatewayRecent || []) {
+      merged.push({ ...ev, _src: 'gw' });
+    }
+    // supply recent is chronological; gateway too — take tails
+    const show = merged.slice(-feedBudget).reverse();
     if (!show.length) {
       add(c(ansi.dim, 'no events yet'));
     } else {
       for (const ev of show) {
-        const tag =
-          ev.kind === 'funded'
-            ? c(ansi.green, 'funded')
-            : ev.kind === 'fail'
-              ? c(ansi.red, 'fail  ')
-              : c(ansi.dim, (ev.kind || 'event').padEnd(6));
-        const who = ev.email ? truncEmail(ev.email, Math.max(10, W - 18)) : ev.text || '';
-        const wtag = ev.worker ? c(ansi.dim, 'w' + ev.worker) + '  ' : '';
-        add(wtag + tag + '  ' + who);
+        let tag;
+        let tagColor = ansi.dim;
+        if (ev.kind === 'funded') {
+          tag = 'funded';
+          tagColor = ansi.green;
+        } else if (ev.kind === 'spend') {
+          tag = 'spend ';
+          tagColor = ansi.yellow;
+        } else if (ev.kind === 'exhaust' || ev.kind === 'empty') {
+          tag = 'empty ';
+          tagColor = ansi.red;
+        } else if (ev.kind === 'fail') {
+          tag = 'fail  ';
+          tagColor = ansi.red;
+        } else {
+          tag = ((ev.kind || 'event') + '      ').slice(0, 6);
+        }
+        const wtag = ev.worker ? c(ansi.dim, 'w' + ev.worker) + ' ' : '';
+        const who = ev.email
+          ? truncEmail(ev.email, Math.max(10, W - 20))
+          : (ev.text || '').slice(0, W - 14);
+        const extra =
+          ev.kind === 'spend' && ev.text
+            ? c(ansi.dim, ' ' + ev.text)
+            : ev.kind === 'funded'
+              ? c(ansi.dim, ' +$5')
+              : '';
+        add(wtag + c(tagColor, tag) + '  ' + who + extra);
       }
-      // if still short, pad is fine — packFrame handles it
     }
   }
-
-  // If STILL short on a tall terminal, stretch the bar section was already full width;
-  // add a blank spacer section label so it doesn't feel like a bug — actually just let pack pad.
 
   const clock = new Date(now).toLocaleTimeString('en-GB', { hour12: false });
   const leftFoot = 'q quit';
@@ -587,6 +795,7 @@ function renderGlance(ctx) {
   return packFrame(out, footer, cols, rows);
 }
 
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -597,6 +806,7 @@ export async function runWatch(opts = {}) {
   const tty = !!(process.stdout.isTTY && !opts.once && process.env.TH_WATCH_ONCE !== '1');
   const rates = createRateTracker();
   const startedAt = Date.now();
+  let sessionStartBal = null;
 
   let quitting = false;
   const restore = () => {
@@ -631,28 +841,36 @@ export async function runWatch(opts = {}) {
   try {
     do {
       const health = await fetchHealth();
-      if (health.ok) rates.push(health.totalBalance);
+      if (health.ok) {
+        rates.push(health.totalBalance);
+        if (sessionStartBal == null) sessionStartBal = health.totalBalance;
+      }
       const ld = launchd(cfg);
       const supply = parseSupplyLog(readTail(supplyLogPath()));
+      const gatewayRecent = parseGatewayLog(readTail(gatewayLogPath()));
       const nowMs = Date.now();
-      for (const w of supply.workers) {
-        const key = String(w.id);
+      for (const wk of supply.workers) {
+        const key = String(wk.id);
         const prev = stageSince.get(key);
-        if (!prev || prev.stage !== w.stage || prev.email !== (w.email || '')) {
-          stageSince.set(key, { stage: w.stage, email: w.email || '', at: nowMs });
-          w.at = nowMs;
+        if (!prev || prev.stage !== wk.stage || prev.email !== (wk.email || '')) {
+          stageSince.set(key, { stage: wk.stage, email: wk.email || '', at: nowMs });
+          wk.at = nowMs;
         } else {
-          w.at = prev.at;
+          wk.at = prev.at;
         }
       }
+      const rateSnap = rates.rates();
       const { cols, rows } = termSize();
       const frame = renderGlance({
         tty,
         health,
         ld,
         supply,
-        netPerMin: rates.netPerMin(),
+        rates: rateSnap,
+        netPerMin: rateSnap.net,
         rateSamples: rates.samples(),
+        sessionStartBal,
+        gatewayRecent,
         now: nowMs,
         startedAt,
         cols,
