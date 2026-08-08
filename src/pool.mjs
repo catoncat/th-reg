@@ -420,6 +420,58 @@ export class Pool {
   }
 
   /** Add a freshly registered account and make it immediately borrowable. */
+  
+  /**
+   * Append-only spend: subtract from in-memory balance + ledger consume.
+   * No network. Used by gateway on every successful upstream response.
+   */
+  consume(key, amount, { model = null, usage = null, source = 'gateway' } = {}) {
+    const rec = this.keys.get(key);
+    if (!rec) return null;
+    const amt = Math.abs(Number(amount) || 0);
+    if (!(amt > 0)) return null;
+    const at = nowIso();
+    // If we never learned a balance, assume opening $5 (welcome grant) so the
+    // first consumes still move the needle instead of staying stuck at book $5
+    // forever after a seed that wrote 5 without subsequent updates.
+    if (rec.balance == null || !Number.isFinite(Number(rec.balance))) {
+      rec.balance = 5;
+    }
+    const next = Math.round(Math.max(0, Number(rec.balance) - amt) * 10000) / 10000;
+    rec.balance = next;
+    rec.lastUsed = at;
+    rec.lastError = null;
+    if (rec.status === 'dead') {
+      /* keep dead */
+    } else if (next <= 0.01) {
+      rec.status = 'exhausted';
+      rec.balance = 0;
+      this._emit({
+        type: 'exhausted',
+        keyFile: rec.file,
+        email: rec.email,
+        at,
+        source,
+        reason: 'consume_to_zero',
+        model: model || undefined,
+      });
+    } else {
+      rec.status = 'ok';
+      this._emit({
+        type: 'consume',
+        keyFile: rec.file,
+        email: rec.email,
+        amount: amt,
+        balance: next,
+        at,
+        source,
+        model: model || undefined,
+        usage: usage || undefined,
+      });
+    }
+    return { balance: rec.balance, status: rec.status, amount: amt };
+  }
+
   addAccount({ email, password, apiKey, balance = null }) {
     let n = 1;
     const names = new Set([...this.keys.values()].map((r) => r.file));

@@ -8,6 +8,11 @@
 // same HTTP request, so Pi only ever sees a clean success or a clean
 // pool-exhausted error.
 //
+// Balance is an append-only local ledger:
+//   open (+$5) → consume (−estimate from usage) → exhausted (=$0 on hard fail).
+// Successful 200s debit the key using response usage × local sell rates — no
+// wallet re-login. Stream requests get stream_options.include_usage injected.
+//
 // Endpoints:
 //   POST /v1/chat/completions   (stream + non-stream passthrough)
 //   GET  /v1/models             (proxied, for pi model discovery)
@@ -17,6 +22,7 @@
 // 403 code=balance_zero for an empty wallet, 401 for a dead key, 429 for quota.
 
 import { createServer } from 'node:http';
+import { estimateCostUsd } from './pricing.mjs';
 
 const UPSTREAM = 'https://tokenharbor.ai/v1';
 const TIMEOUT = 120000; // upstream LLM calls can be slow
@@ -42,10 +48,77 @@ function sendJson(res, status, obj) {
   res.end(b);
 }
 
+/** Ensure streaming responses include a final usage chunk we can cost. */
+function prepareUpstreamBody(bodyBuf) {
+  try {
+    const j = JSON.parse(bodyBuf.toString('utf8'));
+    const model = j.model || null;
+    const streaming = !!j.stream;
+    if (streaming) {
+      j.stream_options = { ...(j.stream_options || {}), include_usage: true };
+      return { body: Buffer.from(JSON.stringify(j)), model, streaming };
+    }
+    return { body: bodyBuf, model, streaming: false };
+  } catch {
+    return { body: bodyBuf, model: null, streaming: false };
+  }
+}
+
+/** Pull OpenAI-style usage from a buffered non-stream or SSE body. */
+function extractUsage(raw, streaming) {
+  if (!raw) return null;
+  if (!streaming) {
+    try {
+      return JSON.parse(raw).usage || null;
+    } catch {
+      return null;
+    }
+  }
+  let usage = null;
+  for (const line of raw.split('\n')) {
+    if (!line.startsWith('data:')) continue;
+    const data = line.replace(/^data:\s?/, '').trim();
+    if (!data || data === '[DONE]') continue;
+    try {
+      const j = JSON.parse(data);
+      if (j.usage) usage = j.usage;
+    } catch {
+      /* partial */
+    }
+  }
+  return usage;
+}
+
+function debit(pool, rec, { model, raw, streaming, log }) {
+  try {
+    const usage = extractUsage(raw, streaming);
+    const cost = estimateCostUsd(model || 'default', usage);
+    if (cost > 0 && typeof pool.consume === 'function') {
+      const r = pool.consume(rec.key, cost, { model, usage, source: 'gateway' });
+      if (r) {
+        log(
+          `${rec.file} (${rec.email || '?'}) -> 200  −$${cost.toFixed(4)}  bal=$${Number(r.balance).toFixed(2)}  ${model || '?'}`,
+        );
+        return;
+      }
+    }
+    pool.report(rec.key, { ok: true });
+    log(`${rec.file} (${rec.email || '?'}) -> 200`);
+  } catch (e) {
+    try {
+      pool.report(rec.key, { ok: true });
+    } catch {
+      /* ignore */
+    }
+    log(`${rec.file} debit-failed ${String(e).slice(0, 60)}`);
+  }
+}
+
 export function createGateway({ pool, log = () => {}, onPoolExhausted = null }) {
   async function handleChat(req, res, bodyBuf) {
     const tried = new Set();
     let lastHard = null;
+    const prepared = prepareUpstreamBody(bodyBuf);
 
     for (let attempt = 0; attempt < MAX_KEY_ATTEMPTS; attempt++) {
       const rec = pool.borrowKey(tried);
@@ -71,7 +144,7 @@ export function createGateway({ pool, log = () => {}, onPoolExhausted = null }) 
         upstream = await fetch(`${UPSTREAM}/chat/completions`, {
           method: 'POST',
           headers: { 'content-type': 'application/json', authorization: `Bearer ${rec.key}` },
-          body: bodyBuf,
+          body: prepared.body,
           signal: AbortSignal.timeout(TIMEOUT),
         });
       } catch (e) {
@@ -83,17 +156,27 @@ export function createGateway({ pool, log = () => {}, onPoolExhausted = null }) 
 
       const status = upstream.status;
       if (status === 200) {
-        pool.report(rec.key, { ok: true });
-        log(`${rec.file} (${rec.email || '?'}) -> 200`);
-        // stream or buffer straight back to Pi
+        // Stream/buffer to client while retaining a copy for usage → local consume.
         res.writeHead(200, {
           'content-type': upstream.headers.get('content-type') || 'application/json',
           'transfer-encoding': 'chunked',
         });
+        const chunks = [];
         if (upstream.body) {
-          for await (const chunk of upstream.body) res.write(chunk);
+          for await (const chunk of upstream.body) {
+            res.write(chunk);
+            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+          }
         }
-        return res.end();
+        res.end();
+        const raw = Buffer.concat(chunks).toString('utf8');
+        debit(pool, rec, {
+          model: prepared.model,
+          raw,
+          streaming: prepared.streaming,
+          log,
+        });
+        return;
       }
 
       // hard failure: classify, retire the key, retry with another
