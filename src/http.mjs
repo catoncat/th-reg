@@ -3,8 +3,13 @@
 // reproducible over plain HTTP once you send device_fingerprint=<UUID> and
 // timezone. This module wraps curl for cookie-jar persistence + header capture.
 
-import { execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { readFileSync as readFileSyncFs, rmSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
+
+const execFileAsync = promisify(execFile);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 import { stickyEndpoint, rotateEndpoint } from './config.mjs';
 
 export const SIGNUP_URL = 'https://tokenharbor.ai/login?mode=signup';
@@ -20,31 +25,36 @@ export function resolveProxy(cfg, sessId) {
 }
 
 /** Run curl with a cookie jar; return { code, location, cookies, body }. */
-export function httpRequest({ method = 'GET', url, data, contentType, jar, proxy, timeout = 30000 }) {
+export async function httpRequest({ method = 'GET', url, data, contentType, jar, proxy, timeout = 30000 }) {
   let lastErr;
   for (let attempt = 0; attempt < 3; attempt++) {
     const args = ['-sS', '-m', String(timeout), '-A', UA];
     if (proxy) args.push('-x', proxy);
     if (jar) args.push('-b', jar, '-c', jar);
     if (data != null) args.push('--data-binary', data);
-    if (contentType) args.push('-H', `content-type: ${contentType}`);
-    const hdrFile = `/tmp/thh-${process.pid}-${randomBytes(4).toString('hex')}.hdr`;
-    const bodyFile = `/tmp/thh-${process.pid}-${randomBytes(4).toString('hex')}.body`;
+    if (contentType) args.push('-H', 'content-type: ' + contentType);
+    const hdrFile = '/tmp/thh-' + process.pid + '-' + randomBytes(4).toString('hex') + '.hdr';
+    const bodyFile = '/tmp/thh-' + process.pid + '-' + randomBytes(4).toString('hex') + '.body';
     args.push('-D', hdrFile, '-o', bodyFile, '-w', '%{http_code}', '-X', method, url);
     let code;
     try {
-      code = Number(execFileSync('curl', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+      const { stdout } = await execFileAsync('curl', args, {
+        encoding: 'utf8',
+        maxBuffer: 4 * 1024 * 1024,
+      });
+      code = Number(stdout);
     } catch (e) {
-      lastErr = e; // transient TLS/reset — retry
-      execFileSync('sleep', ['1']);
+      lastErr = e;
+      try { rmSync(hdrFile, { force: true }); rmSync(bodyFile, { force: true }); } catch { /* ignore */ }
+      await sleep(1000);
       continue;
     }
     let headers = '', body = '';
     try {
-      headers = execFileSync('cat', [hdrFile], { encoding: 'utf8' });
-      body = execFileSync('cat', [bodyFile], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+      headers = readFileSyncFs(hdrFile, 'utf8');
+      body = readFileSyncFs(bodyFile, 'utf8');
     } catch { /* best effort */ }
-    execFileSync('rm', ['-f', hdrFile, bodyFile]);
+    try { rmSync(hdrFile, { force: true }); rmSync(bodyFile, { force: true }); } catch { /* ignore */ }
     return {
       code,
       headers,
@@ -57,8 +67,8 @@ export function httpRequest({ method = 'GET', url, data, contentType, jar, proxy
 }
 
 /** Fetch the sign-up page and return its server-action binding fields. */
-export function fetchActionPage({ jar, proxy }) {
-  const page = httpRequest({ method: 'GET', url: SIGNUP_URL, jar, proxy });
+export async function fetchActionPage({ jar, proxy }) {
+  const page = await httpRequest({ method: 'GET', url: SIGNUP_URL, jar, proxy });
   const val = (name) => {
     const m = page.body.match(new RegExp(`<input[^>]*name="${name}"[^>]*value="([^"]*)"`));
     return m ? m[1].replaceAll('&quot;', '"') : null;
@@ -72,8 +82,8 @@ export function fetchActionPage({ jar, proxy }) {
 }
 
 /** Check signup-precheck; true means Turnstile is required (we skip, never force). */
-export function signupPrecheck(fp, { proxy }) {
-  const r = httpRequest({ method: 'GET', url: `https://tokenharbor.ai/api/auth/signup-precheck?fp=${encodeURIComponent(fp)}`, proxy });
+export async function signupPrecheck(fp, { proxy }) {
+  const r = await httpRequest({ method: 'GET', url: `https://tokenharbor.ai/api/auth/signup-precheck?fp=${encodeURIComponent(fp)}`, proxy });
   try {
     return JSON.parse(r.body);
   } catch {
@@ -82,7 +92,7 @@ export function signupPrecheck(fp, { proxy }) {
 }
 
 /** POST the signup server action. Expect 303 + Supabase session cookie in jar. */
-export function postSignup({ email, password, invite, fp, timezone = 'Asia/Shanghai', actionKey, actionMeta, actionArgs, jar, proxy }) {
+export async function postSignup({ email, password, invite, fp, timezone = 'Asia/Shanghai', actionKey, actionMeta, actionArgs, jar, proxy }) {
   const entries = [
     ['$ACTION_REF_1', ''],
     ['$ACTION_1:0', actionMeta],
@@ -110,7 +120,7 @@ export function postSignup({ email, password, invite, fp, timezone = 'Asia/Shang
 }
 
 /** Open a verify link; returns redirect URL (expect /dashboard?verify=success). */
-export function openVerify(link, { jar, proxy }) {
+export async function openVerify(link, { jar, proxy }) {
   return httpRequest({ method: 'GET', url: link, jar, proxy, timeout: 20000 });
 }
 
@@ -120,7 +130,7 @@ export function openVerify(link, { jar, proxy }) {
  * Registration does not reliably send the mail on its own, so the pure-protocol
  * path triggers it explicitly.
  */
-export function sendVerificationEmail({ jar, proxy }) {
+export async function sendVerificationEmail({ jar, proxy }) {
   return httpRequest({
     method: 'POST',
     url: `${HOST}/api/me/send-verification-email`,
@@ -134,7 +144,7 @@ export function sendVerificationEmail({ jar, proxy }) {
  * List claimable rewards -> { claimable: [{ kind, level, reward }] }.
  * `welcome_grant` is the $5 signup credit.
  */
-export function giftsStatus({ jar, proxy }) {
+export async function giftsStatus({ jar, proxy }) {
   return httpRequest({ method: 'GET', url: `${HOST}/api/gifts/status`, jar, proxy, timeout: 20000 });
 }
 
@@ -143,12 +153,12 @@ export function giftsStatus({ jar, proxy }) {
  * 200 -> { ok: true, rewardUsd: 5, newTrialBalance: 5 }
  * 403 `email_not_verified` -> the mailbox link must be opened first.
  */
-export function claimWelcomeGrant({ jar, proxy }) {
+export async function claimWelcomeGrant({ jar, proxy }) {
   return httpRequest({ method: 'POST', url: `${HOST}/api/welcome/claim`, jar, proxy, timeout: 25000 });
 }
 
 /** POST /api/keys; returns parsed JSON (contains `plaintext` full key). */
-export function createApiKey({ label, jar, proxy }) {
+export async function createApiKey({ label, jar, proxy }) {
   return httpRequest({
     method: 'POST',
     url: 'https://tokenharbor.ai/api/keys',
@@ -167,7 +177,7 @@ export function createApiKey({ label, jar, proxy }) {
  * the consent dialog does POST /api/me/privacy { free_models_enabled: true }.
  * Idempotent — safe to call on an account that already opted in.
  */
-export function enableFreeModels({ jar, proxy }) {
+export async function enableFreeModels({ jar, proxy }) {
   return httpRequest({
     method: 'POST',
     url: `${HOST}/api/me/privacy`,

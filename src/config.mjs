@@ -84,8 +84,10 @@ export function loadConfig(overrides = {}) {
     stateDir: env.TH_STATE_DIR || join(homedir(), '.pi', 'agent', 'state'),
     plistPath: env.TH_PLIST_PATH || join(homedir(), 'Library', 'LaunchAgents', 'com.tokenharbor.supply.plist'),
     supplyService: env.TH_SUPPLY_SERVICE || 'com.tokenharbor.supply',
-    supplyTarget: Number(env.TH_SUPPLY_TARGET || 200),
+    supplyTarget: Number(env.TH_SUPPLY_TARGET || 1000),
     supplyLowWatermark: Number(env.TH_SUPPLY_LOW_WATERMARK || 1.0),
+    // Concurrent register workers inside one supply run (claim∥key already parallel per account).
+    supplyWorkers: Number(env.TH_SUPPLY_WORKERS || 3),
     ...overrides,
   };
 

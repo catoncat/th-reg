@@ -42,7 +42,7 @@ function sendJson(res, status, obj) {
   res.end(b);
 }
 
-export function createGateway({ pool, log = () => {} }) {
+export function createGateway({ pool, log = () => {}, onPoolExhausted = null }) {
   async function handleChat(req, res, bodyBuf) {
     const tried = new Set();
     let lastHard = null;
@@ -51,6 +51,11 @@ export function createGateway({ pool, log = () => {} }) {
       const rec = pool.borrowKey(tried);
       if (!rec) {
         log(`pool exhausted after ${tried.size} key attempt(s)`);
+        try {
+          onPoolExhausted?.({ tried: tried.size });
+        } catch {
+          /* never break the 503 path */
+        }
         return sendJson(res, 503, {
           error: {
             message: 'tokenharbor pool exhausted: no healthy key with balance. Run supply / top-up.',

@@ -72,7 +72,7 @@ export async function registerOne(cfg, { email, password, log = () => {} }) {
 
   try {
     // 1. signup page (jar must be shared with the POST below)
-    const page = fetchActionPage({ jar, proxy });
+    const page = await fetchActionPage({ jar, proxy });
     if (!page.key || page.status !== 200) {
       result.status = 'failed';
       result.error = `signup page fetch failed (http ${page.status})`;
@@ -83,7 +83,7 @@ export async function registerOne(cfg, { email, password, log = () => {} }) {
     result.device_fingerprint = fp;
 
     // 2. precheck — never bypass Turnstile
-    const pre = signupPrecheck(fp, { proxy });
+    const pre = await signupPrecheck(fp, { proxy });
     if (pre.needCaptcha) {
       result.status = 'captcha-required';
       result.note = 'signup-precheck requested Turnstile; not bypassed';
@@ -92,7 +92,7 @@ export async function registerOne(cfg, { email, password, log = () => {} }) {
     }
 
     // 3. submit the server action
-    const r = postSignup({
+    const r = await postSignup({
       email, password, invite: cfg.inviteCode, fp, timezone: cfg.timezone,
       actionKey: page.key, actionMeta: page.meta, actionArgs: page.args,
       jar, proxy,
@@ -119,7 +119,7 @@ export async function registerOne(cfg, { email, password, log = () => {} }) {
     }
 
     // Ask the app to send the mail (signup alone does not reliably send it).
-    const sent = sendVerificationEmail({ jar, proxy });
+    const sent = await sendVerificationEmail({ jar, proxy });
     log(`[·] verification email requested (http ${sent.code})`);
 
     let link = null;
@@ -140,7 +140,7 @@ export async function registerOne(cfg, { email, password, log = () => {} }) {
     }
 
     result.verify_link = link;
-    const v = openVerify(link, { jar, proxy });
+    const v = await openVerify(link, { jar, proxy });
     if (!v.location?.includes('verify=success')) {
       result.status = 'created-unverified';
       result.note = `verify link did not confirm (${v.location || 'http ' + v.code})`;
@@ -170,65 +170,89 @@ export async function registerOne(cfg, { email, password, log = () => {} }) {
  * Supabase `wallets` — the authoritative source. Never infer money from HTML.
  */
 export async function postRegisterSetupHTTP(cfg, { jar, proxy, result, password, log }) {
-  // 1. claim the $5 welcome grant (explicit API call; nothing is automatic)
-  const cr = claimWelcomeGrant({ jar, proxy });
-  let claimed = null;
-  try {
-    claimed = JSON.parse(cr.body);
-  } catch { /* non-JSON body handled below */ }
-  if (cr.code === 200 && claimed?.ok) {
-    log(`[+] welcome grant claimed: $${claimed.rewardUsd} (trial=$${claimed.newTrialBalance})`);
-  } else {
-    const why = claimed?.error?.code || `http ${cr.code}`;
-    result.note = [result.note, `welcome claim failed: ${why}`].filter(Boolean).join(' | ');
-    log(`[!] welcome claim failed: ${why}`);
-  }
-
-  // 2. enable the free-models tier (without it every :free route answers 429
-  //    free_route_inactive). Idempotent.
-  const fr = enableFreeModels({ jar, proxy });
-  let freeEnabled = false;
-  try {
-    freeEnabled = JSON.parse(fr.body)?.free_models_enabled === true;
-  } catch { /* non-JSON */ }
-  result.free_models_enabled = freeEnabled;
-  log(freeEnabled ? '[+] free models enabled' : `[!] free models: http ${fr.code}`);
-
-  // 3. API key — the full value exists only in this response
-  const kr = createApiKey({ label: 'bot-key', jar, proxy });
-  if (kr.code === 200 || kr.code === 201) {
-    try {
-      const j = JSON.parse(kr.body);
-      if (j.plaintext) {
-        result.api_key = j.plaintext;
-        log('[+] API key created');
-      } else {
-        log('[!] api/keys response had no plaintext');
+  // After verify, claim / API key / free-models only need the session cookie.
+  // Run them concurrently (async curl). free-models is best-effort and must
+  // not block a funded paid-route account (opus etc. do not need it).
+  const claimP = claimWelcomeGrant({ jar, proxy })
+    .then((cr) => {
+      let claimed = null;
+      try {
+        claimed = JSON.parse(cr.body);
+      } catch {
+        /* non-JSON */
       }
-    } catch {
-      log('[!] api/keys response not JSON');
-    }
+      return { cr, claimed };
+    })
+    .catch((e) => ({ cr: { code: 0 }, claimed: null, error: e.message }));
+
+  const keyP = createApiKey({ label: 'bot-key', jar, proxy })
+    .then((kr) => {
+      let plaintext = null;
+      if (kr.code === 200 || kr.code === 201) {
+        try {
+          const j = JSON.parse(kr.body);
+          if (j.plaintext) plaintext = j.plaintext;
+        } catch {
+          /* not json */
+        }
+      }
+      return { kr, plaintext };
+    })
+    .catch((e) => ({ kr: { code: 0 }, plaintext: null, error: e.message }));
+
+  const freeP = enableFreeModels({ jar, proxy })
+    .then((fr) => {
+      try {
+        return JSON.parse(fr.body)?.free_models_enabled === true;
+      } catch {
+        return false;
+      }
+    })
+    .catch(() => false);
+
+  const [claimRes, keyRes, freeEnabled] = await Promise.all([claimP, keyP, freeP]);
+
+  result.free_models_enabled = !!freeEnabled;
+  log(freeEnabled ? '[+] free models enabled' : '[·] free models skipped/failed (non-blocking)');
+
+  if (keyRes.plaintext) {
+    result.api_key = keyRes.plaintext;
+    log('[+] API key created');
   } else {
-    log(`[!] api/keys http ${kr.code}`);
+    log(`[!] api/keys failed (${keyRes.error || 'http ' + keyRes.kr?.code})`);
   }
 
-  // 3. authoritative balance check (replaces the old dashboard-regex guess)
-  const wallet = await fetchWallet(result.email, password);
-  if (wallet) {
-    result.balance_trial = wallet.balanceTrial;
-    result.balance_paid = wallet.balancePaid;
-    result.gift_claimed = wallet.balanceTrial >= 5;
+  if (claimRes.claimed?.ok) {
+    const trial = Number(claimRes.claimed.newTrialBalance);
+    result.balance_trial = Number.isFinite(trial) ? trial : Number(claimRes.claimed.rewardUsd) || 5;
+    result.balance_paid = 0;
+    result.gift_claimed = result.balance_trial >= 4.99;
     log(
-      result.gift_claimed
-        ? `[+] wallet confirms $${wallet.balanceTrial.toFixed(2)} trial credit`
-        : `[!] wallet shows only $${wallet.balanceTrial.toFixed(2)} trial credit`
+      `[+] welcome grant claimed: $${claimRes.claimed.rewardUsd ?? 5} (trial=$${result.balance_trial})`,
     );
   } else {
-    result.gift_claimed = false;
-    result.note = [result.note, 'wallet read failed; balance unverified'].filter(Boolean).join(' | ');
-    log('[!] wallet read failed; not asserting any balance');
+    const why = claimRes.claimed?.error?.code || claimRes.error || `http ${claimRes.cr?.code}`;
+    result.note = [result.note, `welcome claim failed: ${why}`].filter(Boolean).join(' | ');
+    log(`[!] welcome claim failed: ${why}`);
+    // Fallback authoritative wallet read only when claim did not confirm money.
+    const wallet = await fetchWallet(result.email, password);
+    if (wallet) {
+      result.balance_trial = wallet.balanceTrial;
+      result.balance_paid = wallet.balancePaid;
+      result.gift_claimed = wallet.balanceTrial >= 4.99;
+      log(
+        result.gift_claimed
+          ? `[+] wallet confirms $${wallet.balanceTrial.toFixed(2)} trial credit`
+          : `[!] wallet shows only $${wallet.balanceTrial.toFixed(2)} trial credit`,
+      );
+    } else {
+      result.gift_claimed = false;
+      result.note = [result.note, 'wallet read failed; balance unverified'].filter(Boolean).join(' | ');
+      log('[!] wallet read failed; not asserting any balance');
+    }
   }
 }
+
 
 function maskProxy(url) {
   return url.replace(/:\/\/[^@]+@/, '://***:***@');

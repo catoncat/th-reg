@@ -89,8 +89,8 @@ are overridable through `loadConfig()` env vars — see `src/config.mjs`:
 # measure the pool (no registration)
 node src/th-supply.mjs --dry
 
-# top up to $100
-node src/th-supply.mjs --target 100
+# top up (default target $1000, 3 concurrent register workers)
+node src/th-supply.mjs --target 1000 --workers 3
 
 # query (read-only, --json for machines)
 # default = cheap local/gateway view (ms); add --live for full Supabase scan

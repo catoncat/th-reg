@@ -18,6 +18,7 @@
 // Run under launchd (com.tokenharbor.gateway) so it stays alive and restarts.
 
 import { join } from 'node:path';
+import { spawn } from 'node:child_process';
 import { loadConfig, PROJECT_ROOT } from './config.mjs';
 import { Pool } from './pool.mjs';
 import { createGateway } from './gateway.mjs';
@@ -32,7 +33,8 @@ const port = Number(process.env.TH_GATEWAY_PORT || 19672);
 // it must never be reachable from the LAN.
 const host = process.env.TH_GATEWAY_HOST || '127.0.0.1';
 // Adopt keys that supply registers while we stay resident (see Pool.refresh).
-const refreshMs = Number(process.env.TH_GATEWAY_REFRESH_MS || 60000);
+// Keep this short: new funded keys should become borrowable within seconds, not a minute.
+const refreshMs = Number(process.env.TH_GATEWAY_REFRESH_MS || 15000);
 
 const ledgerPath = process.env.TH_LEDGER_FILE || join(PROJECT_ROOT, 'data', 'pool-ledger.jsonl');
 const ledger = createLedger(ledgerPath);
@@ -78,7 +80,39 @@ async function warmPool() {
   log(`warm done: ${ok} funded, ${exhausted} exhausted, ${skipped} skipped (rate-limited/unknown)`);
 }
 
-const server = createGateway({ pool, log });
+// When traffic proves the pool is empty, ask launchd to run supply immediately
+// (debounced). Periodic StartInterval is the backstop; this closes the gap
+// between "last healthy tick" and "first 503".
+let lastSupplyKickAt = 0;
+const SUPPLY_KICK_DEBOUNCE_MS = Number(process.env.TH_SUPPLY_KICK_DEBOUNCE_MS || 60_000);
+function requestSupplyKick(reason) {
+  const now = Date.now();
+  if (now - lastSupplyKickAt < SUPPLY_KICK_DEBOUNCE_MS) return;
+  lastSupplyKickAt = now;
+  const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+  if (uid == null) {
+    log(`supply kick skipped (no uid): ${reason}`);
+    return;
+  }
+  // No -k: do not kill an in-flight register run; launchd no-ops if already running.
+  try {
+    const child = spawn(
+      'launchctl',
+      ['kickstart', `gui/${uid}/${cfg.supplyService || 'com.tokenharbor.supply'}`],
+      { detached: true, stdio: 'ignore' },
+    );
+    child.unref();
+    log(`supply kick requested (${reason})`);
+  } catch (e) {
+    log(`supply kick failed: ${e.message}`);
+  }
+}
+
+const server = createGateway({
+  pool,
+  log,
+  onPoolExhausted: () => requestSupplyKick('pool_exhausted'),
+});
 
 server.listen(port, host, async () => {
   const snap = pool.healthSnapshot();

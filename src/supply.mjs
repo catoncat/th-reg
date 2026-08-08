@@ -16,7 +16,7 @@
 // Paths are read from config (cfg.secretsDir, cfg.currentKeyFile, etc.) whose
 // defaults point at ~/.pi/agent/secrets — override via env vars for your setup.
 
-import { readFileSync, writeFileSync, existsSync, appendFileSync, readdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, appendFileSync, openSync, writeSync, closeSync, constants } from 'node:fs';
 import { join } from 'node:path';
 import { loadConfig, randomHex } from './config.mjs';
 import { registerOne } from './register.mjs';
@@ -108,12 +108,25 @@ function setCurrentKey(apiKey, cfg) {
   writeFileSync(cfg.currentKeyFile, apiKey.trim() + '\n', { mode: 0o600 });
 }
 
-/** Persist a new key into the secrets pool (next free slot) for the board. */
+/** Persist a new key into the secrets pool (next free slot). O_EXCL-safe for workers. */
 function persistKey(apiKey, cfg) {
-  let n = 1;
-  const names = new Set(readdirSync(cfg.secretsDir).filter((f) => f.startsWith('tokenharbor-api-key')));
-  while (names.has(`tokenharbor-api-key-${n}`)) n++;
-  writeFileSync(join(cfg.secretsDir, `tokenharbor-api-key-${n}`), apiKey.trim() + '\n', { mode: 0o600 });
+  const body = apiKey.trim() + '\n';
+  for (let n = 1; n < 100000; n++) {
+    const file = join(cfg.secretsDir, `tokenharbor-api-key-${n}`);
+    try {
+      const fd = openSync(file, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+      try {
+        writeSync(fd, body);
+      } finally {
+        closeSync(fd);
+      }
+      return file;
+    } catch (e) {
+      if (e && e.code === 'EEXIST') continue;
+      throw e;
+    }
+  }
+  throw new Error('persistKey: no free slot');
 }
 
 function appendAccount(accountsFile, rec) {
@@ -133,16 +146,19 @@ async function registerUsable(cfg, allocator, usedNames, log) {
   r.password = password;
   appendAccount(cfg.accountsFile, r);
   let balance = 0;
-  if (r.status === 'verified' && r.api_key) {
+  if (r.gift_claimed && r.balance_trial != null) {
+    balance = Number(r.balance_trial) || 0;
+  } else if (r.status === 'verified' && r.api_key) {
+    // claim path did not confirm money — one wallet read
     const snap = await accountSnapshot(email, password);
     balance = snap.error ? 0 : snap.total;
   }
-  const usable = balance > 0.01;
+  const usable = !!r.api_key && balance > 0.01;
   if (usable) {
     persistKey(r.api_key, cfg);
-    log(`  [+] funded account ready: ${email} ($${balance.toFixed(2)})`);
+    log(`  [+] funded account ready: ${email} (${balance.toFixed(2)})`);
   } else {
-    log(`  [!] ${email} not usable (status=${r.status} key=${!!r.api_key} balance=$${balance.toFixed(2)})`);
+    log(`  [!] ${email} not usable (status=${r.status} key=${!!r.api_key} balance=${balance.toFixed(2)})`);
   }
   return usable ? { ...r, _balance: balance } : null;
 }
@@ -158,10 +174,11 @@ async function registerUsable(cfg, allocator, usedNames, log) {
  * @param {number} [opts.maxAdds]  Max new accounts to register (default 60).
  * @param {function} [opts.log]  Logger.
  */
-export async function supply({ cfg, targetUsd, lowWatermark, maxAdds = 60, log = console.log } = {}) {
+export async function supply({ cfg, targetUsd, lowWatermark, maxAdds = 60, workers, log = console.log } = {}) {
   cfg = cfg || loadConfig({});
   targetUsd = targetUsd ?? cfg.supplyTarget;
   lowWatermark = lowWatermark ?? cfg.supplyLowWatermark;
+  workers = Math.max(1, Math.min(8, Number(workers ?? cfg.supplyWorkers ?? 3) || 3));
 
   if (cfg.mailMode === 'none') {
     throw new Error('TH_MAIL_MODE=none cannot produce funded accounts; set TH_MAIL_MODE=cloud-mail');
@@ -172,9 +189,13 @@ export async function supply({ cfg, targetUsd, lowWatermark, maxAdds = 60, log =
   if (cfg.domainMode === 'dynamic') {
     cfEnv = await loadCfEnv({ keychainDir: cfg.cfKeychainDir, scope: cfg.cfEnvchainScope });
   }
+  // Do NOT size the domain pool to the full maxAdds (e.g. 220 for $1000).
+  // init() would try to CF-create dozens of subdomains up front and block refill.
+  // Size for near-term concurrency; DomainAllocator still reuses the allowlist.
+  const domainBatch = Math.min(maxAdds, Math.max(workers * 10, 30));
   const allocator = new DomainAllocator({
     mode: cfg.domainMode,
-    count: maxAdds,
+    count: domainBatch,
     maxReuse: cfg.domainMaxReuse,
     dynamicZones: cfg.dynamicZones,
     fixedPool: cfg.fixedPool,
@@ -214,7 +235,7 @@ export async function supply({ cfg, targetUsd, lowWatermark, maxAdds = 60, log =
     }
   }
 
-  // 3. refill early if below target
+  // 3. refill early if below target (concurrent workers)
   if (total >= targetUsd) {
     log(`pool healthy ($${total.toFixed(2)} >= $${targetUsd}); nothing to add`);
     return { added: 0, total, funded };
@@ -223,28 +244,61 @@ export async function supply({ cfg, targetUsd, lowWatermark, maxAdds = 60, log =
   const usedNames = new Set(accounts.map((a) => (a.email || '').split('@')[0]));
   let added = 0;
   let consecFail = 0;
-  const MAX_CONSEC_FAIL = 4;
-  while (total < targetUsd && added < maxAdds && consecFail < MAX_CONSEC_FAIL) {
-    const need = Math.ceil((targetUsd - total) / 5);
-    log(`below target by $${(targetUsd - total).toFixed(2)} (~${need} account(s)); registering...`);
-    const r = await registerUsable(cfg, allocator, usedNames, log).catch((e) => {
-      log(`  [fail] register: ${e.message}`);
-      return null;
-    });
-    if (r) {
-      added++;
-      consecFail = 0;
-      total += 5;
-    } else {
-      consecFail++;
-      log(`  [retry] ${consecFail}/${MAX_CONSEC_FAIL} consecutive failures`);
-      await sleep(5000);
+  const MAX_CONSEC_FAIL = Math.max(4, workers * 2);
+  // Shared counter lock (JS single-threaded; mutex serializes critical sections across awaits)
+  let chain = Promise.resolve();
+  const withLock = (fn) => {
+    const run = chain.then(fn, fn);
+    chain = run.catch(() => {});
+    return run;
+  };
+
+  log(
+    `refilling with ${workers} worker(s); below target by $${(targetUsd - total).toFixed(2)} (~${Math.ceil((targetUsd - total) / 5)} account(s))`,
+  );
+
+  async function worker(id) {
+    while (true) {
+      const proceed = await withLock(async () => {
+        if (total >= targetUsd || added >= maxAdds || consecFail >= MAX_CONSEC_FAIL) return false;
+        log(
+          `[w${id}] below target by $${(targetUsd - total).toFixed(2)} (added=${added}/${maxAdds}, failStreak=${consecFail}); registering...`,
+        );
+        return true;
+      });
+      if (!proceed) break;
+
+      const r = await registerUsable(cfg, allocator, usedNames, (m) => log(`[w${id}]${m.startsWith(' ') ? '' : ' '}${m}`)).catch((e) => {
+        log(`  [w${id}] [fail] register: ${e.message}`);
+        return null;
+      });
+
+      await withLock(async () => {
+        if (r) {
+          added++;
+          consecFail = 0;
+          total += 5;
+          // Point current at a funded key as soon as we have one.
+          if (!existsSync(cfg.currentKeyFile) || !readFileSync(cfg.currentKeyFile, 'utf8').trim()) {
+            setCurrentKey(r.api_key, cfg);
+            log(`[w${id}] current -> ${r.email} ($${(r._balance || 5).toFixed(2)})`);
+          }
+        } else {
+          consecFail++;
+          log(`  [w${id}] [retry] failStreak ${consecFail}/${MAX_CONSEC_FAIL}`);
+        }
+      });
+
+      // Per-worker pacing (not global serial). Keeps signup pressure bounded.
+      await sleep(cfg.delayMs);
     }
-    await sleep(cfg.delayMs);
   }
+
+  await Promise.all(Array.from({ length: workers }, (_, i) => worker(i + 1)));
+
   if (consecFail >= MAX_CONSEC_FAIL) {
-    log(`stopped after ${MAX_CONSEC_FAIL} consecutive failures (likely captcha/proxy); pool $${total.toFixed(2)}`);
+    log(`stopped after failStreak ${MAX_CONSEC_FAIL} (likely captcha/proxy); pool $${total.toFixed(2)}`);
   }
-  log(`done: +${added} account(s); pool now ~$${total.toFixed(2)}`);
+  log(`done: +${added} account(s); pool now ~$${total.toFixed(2)} (workers=${workers})`);
   return { added, total, funded };
 }
