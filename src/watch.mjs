@@ -113,12 +113,16 @@ async function fetchHealth() {
       activeKeys: Number(j.activeKeys) || 0,
       exhaustedKeys: Number(j.exhaustedKeys) || 0,
       deadKeys: Number(j.deadKeys) || 0,
+      quotaKeys: Number(j.quotaKeys) || 0,
       totalKeys: Number(j.totalKeys) || 0,
       totalBalance: Number(j.totalBalance) || 0,
+      knownBalanceKeys: Number(j.knownBalanceKeys) || 0,
       unknownBalanceKeys: Number(j.unknownBalanceKeys) || 0,
+      usedKeys: j.usedKeys != null ? Number(j.usedKeys) : null,
       ledgerSeq: j.ledgerSeq ?? null,
       current: j.current || null,
       source: j.source || 'gateway',
+      keys: Array.isArray(j.keys) ? j.keys : [],
     };
   } catch (e) {
     return { ok: false, error: e.message || String(e), ms: Date.now() - t0 };
@@ -607,6 +611,49 @@ function rateBar(value, maxRef, width, colorize, color) {
 }
 
 /** Build left column: model burn breakdown. */
+
+/** Pool composition from /health keys (fact buckets, no identity). */
+function poolComposition(health) {
+  const keys = health.keys || [];
+  let fresh = 0; // ~$5 unburned
+  let partial = 0;
+  let zero = 0;
+  let unknown = 0;
+  for (const k of keys) {
+    const b = k.balance;
+    if (b == null || Number.isNaN(b)) unknown++;
+    else if (b <= 0.01) zero++;
+    else if (b >= 4.99) fresh++;
+    else partial++;
+  }
+  // if keys array absent, fall back to counters
+  if (!keys.length) {
+    return {
+      fresh: null,
+      partial: null,
+      zero: health.exhaustedKeys || 0,
+      unknown: health.unknownBalanceKeys || 0,
+      live: health.activeKeys || 0,
+      used: health.usedKeys,
+      total: health.totalKeys || 0,
+      dead: health.deadKeys || 0,
+      quota: health.quotaKeys || 0,
+    };
+  }
+  return {
+    fresh,
+    partial,
+    zero,
+    unknown,
+    live: health.activeKeys || 0,
+    used: health.usedKeys,
+    total: health.totalKeys || keys.length,
+    dead: health.deadKeys || 0,
+    quota: health.quotaKeys || 0,
+  };
+}
+
+/** Build burn-by-model lines (dense single row each). */
 function renderBurnCol(ctx, width) {
   const { gateway, rates, c } = ctx;
   const lines = [];
@@ -619,48 +666,107 @@ function renderBurnCol(ctx, width) {
 
   const total = rows.reduce((s, r) => s + r.amount, 0) || gateway?.totalSpend || 0;
   const burn = rates?.burn;
+  const fill = rates?.fill;
+  const reqs = rows.reduce((s, r) => s + r.count, 0);
 
   if (!rows.length) {
-    lines.push(c(ansi.dim, 'no spend in log window yet'));
-    lines.push('');
-    lines.push(c(ansi.dim, burn == null ? 'rate  …/min' : 'rate  −' + moneyFine(burn) + '/min'));
-    return lines;
+    lines.push(c(ansi.dim, 'no spend in log window'));
+  } else {
+    const nameW = Math.min(12, Math.max(8, Math.floor(width * 0.28)));
+    const moneyW = 9;
+    const metaW = 11; // avg
+    const barW = Math.max(4, width - nameW - moneyW - metaW - 8);
+
+    for (const r of rows.slice(0, 10)) {
+      const pct = total > 0 ? r.amount / total : 0;
+      const name = padVisible(shortModel(r.model), nameW);
+      const amt = ('−' + moneyFine(r.amount)).padStart(moneyW);
+      const avg = r.count ? r.amount / r.count : 0;
+      const meta = (r.count + '× ~' + moneyFine(avg)).padStart(metaW + 4).slice(-metaW - 2);
+      const b = rateBar(r.amount, total, barW, c, ansi.red);
+      lines.push(
+        c(ansi.bold, name) +
+          c(ansi.dim, amt) +
+          ' ' +
+          b +
+          ' ' +
+          c(ansi.dim, meta),
+      );
+    }
+    if (rows.length > 10) lines.push(c(ansi.dim, '+' + (rows.length - 10) + ' models'));
   }
 
-  const nameW = Math.min(14, Math.max(8, Math.floor(width * 0.35)));
-  const moneyW = 9;
-  const barW = Math.max(6, width - nameW - moneyW - 6);
-
-  for (const r of rows.slice(0, 8)) {
-    const pct = total > 0 ? r.amount / total : 0;
-    const name = padVisible(shortModel(r.model), nameW);
-    const amt = ('−' + moneyFine(r.amount)).padStart(moneyW);
-    const share = String(Math.round(pct * 100)).padStart(3) + '%';
-    const hits = (r.count + '×').padStart(4);
-    const b = rateBar(r.amount, total, Math.max(4, barW - 8), c, ansi.red);
-    lines.push(
-      c(ansi.bold, name) +
-        ' ' +
-        c(ansi.dim, amt) +
-        ' ' +
-        b +
-        ' ' +
-        c(ansi.dim, share + ' ' + hits.trim()),
-    );
-  }
-
-  if (rows.length > 8) {
-    lines.push(c(ansi.dim, '+' + (rows.length - 8) + ' more models'));
-  }
-
-  lines.push('');
-  const rateTxt = burn == null ? 'rate  …/min' : 'rate  −' + moneyFine(burn) + '/min';
-  const winTxt = total > 0 ? 'window −' + moneyFine(total) : '';
-  lines.push(c(ansi.dim, rateTxt + (winTxt ? '  ·  ' + winTxt : '')));
+  // compact totals under models
+  const bits = [];
+  if (total > 0) bits.push('win −' + moneyFine(total));
+  if (reqs) bits.push(reqs + ' req');
+  if (burn != null) bits.push('−' + moneyFine(burn) + '/min');
+  if (bits.length) lines.push(c(ansi.dim, bits.join(' · ')));
   return lines;
 }
 
-/** Build right column: supply stage strip (email only while registering). */
+/** Rates column: burn/fill bars + headroom. */
+function renderFlowCol(ctx, width) {
+  const { rates, health, ld, sessionStartBal, rateSamples, c } = ctx;
+  const lines = [];
+  lines.push(c(ansi.dim, 'FLOW'));
+
+  const burn = rates?.burn;
+  const fill = rates?.fill;
+  const net = rates?.net;
+  const target = ld.targetUsd || 1000;
+  const bal = health.ok ? health.totalBalance : 0;
+  const ref = Math.max(burn || 0, fill || 0, Math.abs(net || 0), 1);
+  const barW = Math.max(6, width - 16);
+
+  const burnStr = burn == null ? '…' : ('−' + moneyFine(burn)).padStart(8);
+  const fillStr = fill == null ? '…' : ('+' + moneyFine(fill)).padStart(8);
+  const netStr =
+    net == null ? '…' : ((net >= 0 ? '+' : '') + moneyFine(net)).padStart(8);
+
+  lines.push(
+    c(ansi.red, 'burn') +
+      ' ' +
+      c(ansi.dim, burnStr) +
+      ' ' +
+      rateBar(burn || 0, ref, barW, c, ansi.red),
+  );
+  lines.push(
+    c(ansi.green, 'fill') +
+      ' ' +
+      c(ansi.dim, fillStr) +
+      ' ' +
+      rateBar(fill || 0, ref, barW, c, ansi.green),
+  );
+  lines.push(c(ansi.dim, 'net  ' + netStr + '/min'));
+
+  // headroom / clear
+  if (net != null && net < -0.05 && bal > 0) {
+    lines.push(c(ansi.yellow, '503 in ~' + fmtDur((bal / Math.abs(net)) * 60)));
+  } else if (net != null && net > 0.05 && bal < target) {
+    lines.push(c(ansi.dim, 'clear ~' + fmtDur(((target - bal) / net) * 60)));
+  } else if (net != null && Math.abs(net) <= 0.05) {
+    lines.push(c(ansi.dim, 'flat · holding'));
+  } else {
+    lines.push(c(ansi.dim, 'rate warming…'));
+  }
+
+  if (sessionStartBal != null && Number.isFinite(sessionStartBal)) {
+    const d = bal - sessionStartBal;
+    if (Math.abs(d) >= 0.005) {
+      lines.push(c(ansi.dim, 'session ' + (d >= 0 ? '+' : '') + moneyBook(d)));
+    }
+  }
+
+  // mini spark if room
+  if (rateSamples && rateSamples.length >= 2 && width >= 16) {
+    lines.push(sparkline(rateSamples, Math.min(width, 28), c));
+  }
+
+  return lines;
+}
+
+/** Supply column. */
 function renderSupplyCol(ctx, width) {
   const { ld, supply, c } = ctx;
   const lines = [];
@@ -672,10 +778,12 @@ function renderSupplyCol(ctx, width) {
   }
 
   if (!ld.running) {
-    lines.push(c(ansi.dim, 'idle · next tick ≤60s'));
+    lines.push(c(ansi.dim, 'idle · next ≤60s'));
+    if (ld.targetUsd) lines.push(c(ansi.dim, 'target ' + money(ld.targetUsd)));
     if (supply.added != null && supply.added > 0) {
-      lines.push(c(ansi.dim, 'last run +' + supply.added));
+      lines.push(c(ansi.dim, 'last +' + supply.added + (supply.maxAdds != null ? '/' + supply.maxAdds : '')));
     }
+    if (supply.failStreak) lines.push(c(ansi.red, 'fail streak ' + supply.failStreak));
     return lines;
   }
 
@@ -695,34 +803,62 @@ function renderSupplyCol(ctx, width) {
             : wk.stage === 'opening'
               ? ansi.yellow
               : null;
-      // Email only meaningful mid-register; hide on done/fail noise
       const showId =
         wk.stage === 'mail' ||
         wk.stage === 'verify' ||
         wk.stage === 'signup' ||
         wk.stage === 'opening';
-      const id = showId && wk.email ? truncEmail(wk.email, Math.max(8, width - 18)) : '';
-      const left = c(ansi.dim, 'w' + wk.id) + ' ' + c(stageColor, stageLabel(wk.stage).trim());
-      const room = Math.max(1, width - stripAnsi(left).length - String(ageStr).length - 1);
-      const mid = id ? ' ' + padVisible(id, Math.min(room, stripAnsi(id).length + 1)) : '';
-      const pad = Math.max(1, width - stripAnsi(left + mid).length - String(ageStr).length);
-      lines.push(left + mid + ' '.repeat(pad) + c(ansi.dim, String(ageStr)));
+      const id =
+        showId && wk.email ? truncEmail(wk.email, Math.max(6, width - 16)) : '';
+      const left =
+        c(ansi.dim, 'w' + wk.id) + ' ' + c(stageColor, stageLabel(wk.stage).trim());
+      const mid = id ? ' ' + id : '';
+      const padn = Math.max(1, width - stripAnsi(left + mid).length - String(ageStr).length);
+      lines.push(left + mid + ' '.repeat(padn) + c(ansi.dim, String(ageStr)));
     }
   }
 
   const bits = [];
-  if (supply.added != null) bits.push('+' + supply.added + ' this run');
+  if (supply.added != null) bits.push('+' + supply.added + ' run');
   if (supply.maxAdds != null && supply.added != null) bits.push(supply.added + '/' + supply.maxAdds);
-  if (supply.failStreak) bits.push('fail×' + supply.failStreak);
-  if (bits.length) lines.push(c(ansi.dim, bits.join(' · ')));
+  if (supply.failStreak) bits.push(c(ansi.red, 'fail×' + supply.failStreak));
+  if (ld.pid) bits.push('pid ' + ld.pid);
+  // bits may contain ansi from fail - join carefully
+  if (supply.added != null || supply.failStreak || ld.pid) {
+    const plain = [];
+    if (supply.added != null) {
+      plain.push(
+        '+' +
+          supply.added +
+          (supply.maxAdds != null ? '/' + supply.maxAdds : '') +
+          ' run',
+      );
+    }
+    if (supply.failStreak) plain.push('fail×' + supply.failStreak);
+    if (ld.pid) plain.push('pid ' + ld.pid);
+    lines.push(c(ansi.dim, plain.join(' · ')));
+  }
+
+  // recent funded rate from supply.recent
+  const funded = (supply.recent || []).filter((e) => e.kind === 'funded').length;
+  const fails = (supply.recent || []).filter((e) => e.kind === 'fail').length;
+  if (funded || fails) {
+    lines.push(
+      c(ansi.dim, 'log ') +
+        (funded ? c(ansi.green, 'fund×' + funded) : '') +
+        (funded && fails ? c(ansi.dim, ' ') : '') +
+        (fails ? c(ansi.red, 'fail×' + fails) : ''),
+    );
+  }
   return lines;
 }
 
 /**
- * Layout:
- *   [ hero: mood + pool bar full width ]
- *   [ BURN BY MODEL  |  SUPPLY ]   ← side by side when wide
- *   [ pulse: last model events ]   ← only leftover rows, no emails
+ * Layout denser:
+ *   hero mood
+ *   money + bar + composition (multi KPI lines)
+ *   3-col when wide: BURN | FLOW | SUPPLY
+ *   PULSE fills ALL leftover rows (dense ticket tape, no emails)
  */
 function renderGlance(ctx) {
   const {
@@ -736,6 +872,7 @@ function renderGlance(ctx) {
     rows,
     sessionStartBal,
     gateway,
+    rateSamples,
   } = ctx;
   const tty = ctx.tty;
   const c = (code, s) => paint(tty, code, s);
@@ -746,16 +883,15 @@ function renderGlance(ctx) {
   const bal = health.ok ? health.totalBalance : 0;
   const pct = target > 0 ? bal / target : 0;
   const net = rateObj?.net ?? netPerMin;
+  const comp = health.ok ? poolComposition(health) : null;
 
-  const gutter = 2;
+  const gutter = 1;
   const W = Math.max(40, cols - gutter * 2);
   const pad = (s) => ' '.repeat(gutter) + s;
   const out = [];
   const add = (s = '') => out.push(s.length ? pad(s) : '');
-  const addRaw = (s = '') => out.push(s); // already padded via zip
 
   // ── HERO ────────────────────────────────────────────────
-  add('');
   add(c(ansi.bold, c(head.color, head.title)));
   if (head.sub) add(c(ansi.dim, head.sub));
 
@@ -763,19 +899,14 @@ function renderGlance(ctx) {
     add('');
     add(c(ansi.dim, 'launchctl kickstart gui/$(id -u)/com.tokenharbor.gateway'));
   } else {
-    add('');
-    // pool one strip: money + bar + live counts on one visual band
+    // money line
     const balColor =
       mood === 'EMPTY' ? ansi.red : mood === 'HEALTHY' || mood === 'BALANCED' ? ansi.green : ansi.bold;
-    const left = c(balColor, moneyBook(bal));
-    const right = c(ansi.dim, '/ ' + money(target));
-    const meta =
-      health.activeKeys +
-      ' live · ' +
-      health.exhaustedKeys +
-      '∅' +
-      (health.usedKeys != null ? ' · ' + health.usedKeys + ' used' : '');
-    add(left + ' ' + right + '  ' + c(ansi.dim, meta));
+    add(
+      c(balColor, moneyBook(bal)) +
+        c(ansi.dim, ' / ' + money(target)) +
+        c(ansi.dim, '  ·  ' + Math.round(pct * 100) + '%'),
+    );
 
     const barColor =
       mood === 'EMPTY'
@@ -783,103 +914,265 @@ function renderGlance(ctx) {
         : mood === 'HEALTHY' || mood === 'BALANCED'
           ? ansi.green
           : ansi.yellow;
-    add(bar(pct, W, c, barColor));
-
-    // session delta under bar
-    const bits = [];
-    if (sessionStartBal != null && Number.isFinite(sessionStartBal)) {
-      const d = bal - sessionStartBal;
-      if (Math.abs(d) >= 0.005) bits.push('session ' + (d >= 0 ? '+' : '') + moneyBook(d));
+    // bar + spark on same visual band when wide
+    if (W >= 70 && rateSamples && rateSamples.length >= 2) {
+      const sparkW = Math.min(24, Math.floor(W * 0.25));
+      const barW = W - sparkW - 1;
+      add(bar(pct, barW, c, barColor) + ' ' + sparkline(rateSamples, sparkW, c));
+    } else {
+      add(bar(pct, W, c, barColor));
     }
-    if (net != null) bits.push('net ' + (net >= 0 ? '+' : '') + moneyFine(net) + '/min');
-    bits.push(Math.round(pct * 100) + '%');
-    if (bits.length) add(c(ansi.dim, bits.join('  ·  ')));
+
+    // composition — the density the screenshot was missing
+    if (comp) {
+      const parts = [];
+      parts.push(comp.live + ' live');
+      if (comp.partial != null) parts.push(comp.partial + ' mid');
+      if (comp.fresh != null) parts.push(comp.fresh + ' full');
+      parts.push((comp.zero || 0) + '∅');
+      if (comp.dead) parts.push(comp.dead + ' dead');
+      if (comp.quota) parts.push(comp.quota + ' quota');
+      if (comp.used != null) parts.push(comp.used + ' used');
+      parts.push(comp.total + ' keys');
+      if (health.ledgerSeq != null) parts.push('#' + health.ledgerSeq);
+      add(c(ansi.dim, parts.join(' · ')));
+    }
+
+    // session / net / burn / fill one KPI strip
+    {
+      const bits = [];
+      if (sessionStartBal != null && Number.isFinite(sessionStartBal)) {
+        const d = bal - sessionStartBal;
+        if (Math.abs(d) >= 0.005) bits.push('sess ' + (d >= 0 ? '+' : '') + moneyBook(d));
+      }
+      if (rateObj?.burn != null) bits.push('burn −' + moneyFine(rateObj.burn) + '/m');
+      if (rateObj?.fill != null) bits.push('fill +' + moneyFine(rateObj.fill) + '/m');
+      if (net != null) bits.push('net ' + (net >= 0 ? '+' : '') + moneyFine(net) + '/m');
+      if (gateway?.totalSpend) bits.push('win −' + moneyFine(gateway.totalSpend));
+      const reqs = gateway?.byModel
+        ? Object.values(gateway.byModel).reduce((s, v) => s + (v.count || 0), 0)
+        : 0;
+      if (reqs) bits.push(reqs + ' req');
+      if (bits.length) add(c(ansi.dim, bits.join('  ·  ')));
+    }
 
     add('');
 
-    // ── MAIN: two columns when wide enough ────────────────
-    const useCols = W >= 72;
-    const leftW = useCols ? Math.floor(W * 0.58) : W;
-    const burnLines = renderBurnCol({ gateway, rates: rateObj, c }, leftW);
-    const supplyLines = renderSupplyCol({ ld, supply, c }, useCols ? W - leftW - 3 : W);
-
-    if (useCols) {
-      for (const row of zipColumns(burnLines, supplyLines, leftW, W, 3)) {
-        add(row);
+    // ── MAIN columns ──────────────────────────────────────
+    // wide (≥100): 3-col burn | flow | supply
+    // mid  (≥72): 2-col burn | supply, flow folded into hero already
+    // narrow: stack
+    if (W >= 100) {
+      const g = 2;
+      const c1 = Math.floor(W * 0.42);
+      const c2 = Math.floor(W * 0.28);
+      const c3 = W - c1 - c2 - g * 2;
+      const L = renderBurnCol({ gateway, rates: rateObj, c }, c1);
+      const M = renderFlowCol(
+        { rates: rateObj, health, ld, sessionStartBal, rateSamples, c },
+        c2,
+      );
+      const R = renderSupplyCol({ ld, supply, c }, c3);
+      const n = Math.max(L.length, M.length, R.length);
+      for (let i = 0; i < n; i++) {
+        add(
+          padVisible(L[i] || '', c1) +
+            ' '.repeat(g) +
+            padVisible(M[i] || '', c2) +
+            ' '.repeat(g) +
+            padVisible(R[i] || '', c3),
+        );
+      }
+    } else if (W >= 72) {
+      const g = 3;
+      const c1 = Math.floor(W * 0.58);
+      const c2 = W - c1 - g;
+      const L = renderBurnCol({ gateway, rates: rateObj, c }, c1);
+      const R = renderSupplyCol({ ld, supply, c }, c2);
+      // inject flow summary at top of right if supply short
+      const flowBits = renderFlowCol(
+        { rates: rateObj, health, ld, sessionStartBal, rateSamples: null, c },
+        c2,
+      );
+      // merge: flow first lines then supply (skip duplicate header spacing)
+      const right = [...flowBits, '', ...R];
+      const n = Math.max(L.length, right.length);
+      for (let i = 0; i < n; i++) {
+        add(padVisible(L[i] || '', c1) + ' '.repeat(g) + padVisible(right[i] || '', c2));
       }
     } else {
-      // narrow: burn first, then supply — still not a long laundry list
-      for (const line of burnLines) add(line);
+      for (const line of renderBurnCol({ gateway, rates: rateObj, c }, W)) add(line);
       add('');
-      for (const line of supplyLines) add(line);
+      for (const line of renderFlowCol(
+        { rates: rateObj, health, ld, sessionStartBal, rateSamples, c },
+        W,
+      ))
+        add(line);
+      add('');
+      for (const line of renderSupplyCol({ ld, supply, c }, W)) add(line);
     }
   }
 
-  // ── PULSE: leftover rows = recent model activity (no emails) ──
+  // ── PULSE + STATS: fill leftover without email spam ─────
   const footerReserve = 1;
-  const used = out.length;
-  const leftover = Math.max(0, rows - footerReserve - used);
+  const leftover = Math.max(0, rows - footerReserve - out.length);
 
-  if (mood !== 'DOWN' && leftover >= 3) {
+  if (mood !== 'DOWN' && leftover >= 2) {
     add('');
-    add(c(ansi.dim, 'PULSE'));
-    const budget = Math.max(1, leftover - 2);
-    // collapse consecutive spends into per-model ticks
+    add(c(ansi.dim, 'ACTIVITY'));
+    let budget = Math.max(1, rows - footerReserve - out.length);
+    const lines = [];
     const recent = gateway?.recent || [];
-    const pulse = [];
-    // also fold supply funded counts (no email)
+    const spends = recent.filter((e) => e.kind === 'spend');
+
+    // chips
     let fundedN = 0;
+    let failN = 0;
     for (const ev of supply.recent || []) {
       if (ev.kind === 'funded') fundedN++;
+      if (ev.kind === 'fail') failN++;
     }
-    if (fundedN > 0) pulse.push(c(ansi.green, 'funded') + c(ansi.dim, '  +$5 ×' + fundedN));
+    const exhN = recent.filter((e) => e.kind === 'exhaust').length;
+    const chips = [];
+    if (fundedN) chips.push(c(ansi.green, 'fund×' + fundedN));
+    if (failN) chips.push(c(ansi.red, 'fail×' + failN));
+    if (exhN) chips.push(c(ansi.red, 'empty×' + exhN));
+    if (spends.length) chips.push(c(ansi.dim, 'spend×' + spends.length));
+    if (chips.length) lines.push(chips.join('  '));
 
-    // last spends grouped by model in reverse chrono chunks
-    const tail = recent.filter((e) => e.kind === 'spend').slice(-40);
+    // spend size histogram (useful shape, not identity)
+    if (spends.length >= 3) {
+      const edges = [0.05, 0.25, 0.5, 1.0, 1.5, 2.5, 5, Infinity];
+      const labels = ['≤5¢', '≤25¢', '≤50¢', '≤$1', '≤$1.5', '≤$2.5', '≤$5', '>$5'];
+      const bins = edges.map(() => 0);
+      for (const s of spends) {
+        const a = s.amount || 0;
+        for (let i = 0; i < edges.length; i++) {
+          if (a <= edges[i]) {
+            bins[i]++;
+            break;
+          }
+        }
+      }
+      const maxB = Math.max(...bins, 1);
+      // pack 2 bins per line when narrow, else more compact single lines
+            const histLines = [];
+      for (let i = 0; i < bins.length; i++) {
+        if (!bins[i]) continue;
+        const maxHist = Math.min(28, Math.max(10, Math.floor(W * 0.35)));
+        const bw = Math.max(1, Math.round(maxHist * (bins[i] / maxB)));
+        histLines.push(
+          c(ansi.dim, labels[i].padEnd(5)) +
+            ' ' +
+            c(ansi.yellow, '='.repeat(bw)) +
+            c(ansi.dim, '-'.repeat(maxHist - bw)) +
+            c(ansi.dim, (' ' + bins[i]).padStart(4)),
+        );
+      }
+      if (histLines.length) {
+        lines.push(c(ansi.dim, 'ticket $'));
+        for (const hl of histLines.slice(0, 6)) lines.push(hl);
+      }
+    }
+
+    // per-model summary (sum, count, avg, last)
     /** @type {Map<string, number[]>} */
     const buckets = new Map();
-    for (const ev of tail) {
+    for (const ev of spends) {
       const k = ev.model || '?';
       if (!buckets.has(k)) buckets.set(k, []);
       buckets.get(k).push(ev.amount);
     }
-    // show models by most recent activity order
-    const order = [];
-    const seen = new Set();
-    for (let i = tail.length - 1; i >= 0; i--) {
-      const m = tail[i].model || '?';
-      if (seen.has(m)) continue;
-      seen.add(m);
-      order.push(m);
-    }
-    for (const m of order) {
-      const amts = buckets.get(m) || [];
-      const last3 = amts.slice(-3).map((a) => '−' + moneyFine(a)).join(' ');
-      const line =
-        c(ansi.bold, padVisible(shortModel(m), 12)) +
-        ' ' +
-        c(ansi.dim, last3) +
-        c(ansi.dim, amts.length > 3 ? '  ×' + amts.length : '');
-      pulse.push(line);
+    const order = [...buckets.entries()].sort((a, b) => {
+      const sa = a[1].reduce((x, y) => x + y, 0);
+      const sb = b[1].reduce((x, y) => x + y, 0);
+      return sb - sa;
+    });
+    for (const [m, amts] of order) {
+      const sum = amts.reduce((a, b) => a + b, 0);
+      const avg = amts.length ? sum / amts.length : 0;
+      const last = amts.slice(-5).map((a) => moneyFine(a).replace('$', ''));
+      lines.push(
+        c(ansi.bold, padVisible(shortModel(m), 10)) +
+          c(ansi.dim, ('−' + moneyFine(sum)).padStart(9)) +
+          c(ansi.dim, ('×' + amts.length).padStart(5)) +
+          c(ansi.dim, ('avg ' + moneyFine(avg)).padStart(12)) +
+          c(ansi.dim, '  last ' + last.join(' ')),
+      );
     }
 
-    // exhaust blips (dedupe)
-    const exhN = recent.filter((e) => e.kind === 'exhaust').length;
-    const emptyN = recent.filter((e) => e.kind === 'empty').length;
-    if (exhN > 0) pulse.push(c(ansi.red, 'key empty') + c(ansi.dim, '  ×' + exhN + ' in window'));
-    if (emptyN > 0) pulse.push(c(ansi.red, 'pool empty'));
+    // current pointer (ops useful, still no random emails list)
+    if (health.current && (health.current.balance != null || health.current.status)) {
+      const cb =
+        health.current.balance != null ? moneyBook(Number(health.current.balance)) : '?';
+      lines.push(
+        c(ansi.dim, 'cursor ') +
+          c(ansi.dim, String(health.current.status || 'ok')) +
+          c(ansi.dim, ' book ' + cb) +
+          (health.current.file ? c(ansi.dim, '  ' + String(health.current.file).replace('tokenharbor-api-key', 'key')) : ''),
+      );
+    }
 
-    if (!pulse.length) {
+    // fill remaining with a single spark of recent spend magnitudes (not labels)
+    const room = budget - lines.length;
+    if (room > 0 && spends.length >= 4) {
+      const vals = spends.slice(-Math.min(spends.length, W * room)).map((s) => s.amount);
+      // render as block sparkline row(s)
+      const blocks = '▁▂▃▄▅▆▇█';
+      const min = Math.min(...vals);
+      const max = Math.max(...vals);
+      const span = max - min || 1;
+      let spark = '';
+      for (const v of vals) {
+        spark += blocks[Math.min(7, Math.floor(((v - min) / span) * 7))];
+      }
+      // wrap spark across rows
+      for (let i = 0; i < spark.length && lines.length < budget; i += W) {
+        const chunk = spark.slice(i, i + W);
+        lines.push(
+          c(ansi.dim, i === 0 ? 'req $' : '    ') +
+            (i === 0 ? ' ' : '') +
+            c(ansi.yellow, i === 0 ? chunk.slice(0, Math.max(0, W - 6)) : chunk),
+        );
+      }
+      lines.push(c(ansi.dim, 'req $ span ' + moneyFine(min) + '…' + moneyFine(max)));
+    }
+
+    if (!lines.length) {
       add(c(ansi.dim, 'waiting for traffic…'));
     } else {
-      for (const line of pulse.slice(0, budget)) add(line);
+      for (const line of lines.slice(0, budget)) add(line);
     }
   }
 
+  // if still short of rows, don't leave a giant void feeling — add a status dock
+  while (out.length < rows - 2) {
+    // only pad one analytical line once then blanks via packFrame
+    break;
+  }
+  // status dock just above footer when we have 1 spare conceptual row in content
+  {
+    const asOf = health.ok && health.asOf ? String(health.asOf).slice(11, 19) + 'Z' : '';
+    const src = health.ok ? health.source || '' : '';
+    const dock = [src, asOf, health.ok ? 'ledger #' + (health.ledgerSeq ?? '—') : null]
+      .filter(Boolean)
+      .join(' · ');
+    // put dock into footer area instead of content if tight
+    var dockStr = dock;
+  }
+
   const clock = new Date(now).toLocaleTimeString('en-GB', { hour12: false });
-  const leftFoot = 'q quit';
-  const gap = Math.max(2, cols - gutter * 2 - leftFoot.length - clock.length);
-  const footer = pad(c(ansi.dim, leftFoot) + ' '.repeat(gap) + c(ansi.dim, clock));
+  const leftFoot = 'q quit' + (dockStr ? c(ansi.dim, '  ·  ' + dockStr) : '');
+  // leftFoot has ansi - compute gap with strip
+  const leftVis = stripAnsi('q quit' + (dockStr ? '  ·  ' + dockStr : ''));
+  const gap = Math.max(2, cols - gutter * 2 - leftVis.length - clock.length);
+  const footer =
+    pad(
+      c(ansi.dim, 'q quit') +
+        (dockStr ? c(ansi.dim, '  ·  ' + dockStr) : '') +
+        ' '.repeat(gap) +
+        c(ansi.dim, clock),
+    );
 
   if (!tty) {
     return [...out, '', footer].join('\n') + '\n';
