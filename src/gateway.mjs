@@ -50,10 +50,10 @@ export function createGateway({ pool, log = () => {} }) {
     for (let attempt = 0; attempt < MAX_KEY_ATTEMPTS; attempt++) {
       const rec = pool.borrowKey(tried);
       if (!rec) {
-        log(`[gateway] pool exhausted after ${tried.size} key attempt(s)`);
+        log(`pool exhausted after ${tried.size} key attempt(s)`);
         return sendJson(res, 503, {
           error: {
-            message: 'tokenharbor pool exhausted: no healthy key with balance. Run `th board` / top-up.',
+            message: 'tokenharbor pool exhausted: no healthy key with balance. Run supply / top-up.',
             type: 'pool_exhausted',
             code: 'pool_exhausted',
           },
@@ -72,14 +72,14 @@ export function createGateway({ pool, log = () => {} }) {
       } catch (e) {
         // network-level failure talking to upstream; do NOT kill the key
         pool.report(rec.key, { ok: false, reason: 'network', error: String(e).slice(0, 80) });
-        log(`[gateway] ${rec.file} network error, trying next key`);
+        log(`${rec.file} network error, trying next key`);
         continue;
       }
 
       const status = upstream.status;
       if (status === 200) {
         pool.report(rec.key, { ok: true });
-        log(`[gateway] ${rec.file} (${rec.email || '?'}) -> 200`);
+        log(`${rec.file} (${rec.email || '?'}) -> 200`);
         // stream or buffer straight back to Pi
         res.writeHead(200, {
           'content-type': upstream.headers.get('content-type') || 'application/json',
@@ -95,11 +95,13 @@ export function createGateway({ pool, log = () => {} }) {
       let code = '';
       try {
         code = (await upstream.clone().json())?.error?.code || '';
-      } catch { /* not json */ }
+      } catch {
+        /* not json */
+      }
       const reason = classify(status, code);
       pool.report(rec.key, { ok: false, reason, error: code || `http ${status}` });
       lastHard = { status, code, reason, file: rec.file };
-      log(`[gateway] ${rec.file} -> ${status} ${code} (${reason}); rotating`);
+      log(`${rec.file} -> ${status} ${code} (${reason}); rotating`);
       // loop continues with a different key
     }
 
@@ -117,17 +119,29 @@ export function createGateway({ pool, log = () => {} }) {
     const url = new URL(req.url, 'http://localhost');
     try {
       if (req.method === 'GET' && url.pathname === '/health') {
+        // Prefer Pool.healthSnapshot (includes exhausted=$0 facts learned from traffic).
+        if (typeof pool.healthSnapshot === 'function') {
+          return sendJson(res, 200, pool.healthSnapshot());
+        }
         return sendJson(res, 200, {
           ok: pool.activeCount() > 0,
           activeKeys: pool.activeCount(),
           totalBalance: Number(pool.totalBalance().toFixed(2)),
-          keys: pool.all().map((r) => ({ file: r.file, status: r.status, balance: r.balance, email: r.email })),
+          keys: pool.all().map((r) => ({
+            file: r.file,
+            status: r.status,
+            balance: r.balance,
+            email: r.email,
+          })),
         });
       }
       if (req.method === 'GET' && url.pathname === '/v1/models') {
         const rec = pool.borrowKey();
         if (!rec) return sendJson(res, 503, { error: { message: 'pool exhausted' } });
-        const u = await fetch(`${UPSTREAM}/models`, { headers: { authorization: `Bearer ${rec.key}` }, signal: AbortSignal.timeout(20000) });
+        const u = await fetch(`${UPSTREAM}/models`, {
+          headers: { authorization: `Bearer ${rec.key}` },
+          signal: AbortSignal.timeout(20000),
+        });
         const j = await u.json().catch(() => ({}));
         return sendJson(res, u.status, j);
       }
@@ -137,7 +151,16 @@ export function createGateway({ pool, log = () => {} }) {
       }
       sendJson(res, 404, { error: { message: 'not found' } });
     } catch (e) {
-      sendJson(res, 500, { error: { message: String(e).slice(0, 200) } });
+      // Only send if headers not already flushed (e.g. mid-stream failure).
+      if (!res.headersSent) {
+        sendJson(res, 500, { error: { message: String(e).slice(0, 200) } });
+      } else {
+        try {
+          res.end();
+        } catch {
+          /* ignore */
+        }
+      }
     }
   });
 }

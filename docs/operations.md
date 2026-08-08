@@ -13,12 +13,13 @@ balances.
 
 | Module | Role |
 | --- | --- |
-| `src/th-api.mjs` | Authoritative account queries: login → wallet / transactions / credit grants, and `probeKey` (key health). The one place the "what does this account actually have" question is answered. |
-| `src/th.mjs` | Read-only CLI: `th pool status|usage|accounts`, `th supply status`, `th current`. Emits human tables or `--json`. Designed to be called by an agent, never prints credentials. |
-| `src/supply.mjs` | **Auto-supply.** Keeps total pool balance ≥ a target by registering fresh accounts *before* the pool runs dry. |
+| `src/th-api.mjs` | Authoritative account queries: login → wallet / transactions / credit grants, and `probeKey` (key health). The one place a *live* "what does this account actually have" question is answered. |
+| `src/ledger.mjs` | Append-only pool ledger (`data/pool-ledger.jsonl`). Events: `open` / `set_balance` / `exhausted` / `dead` / `consume`. Fold derives balances; readers do not re-login the fleet. |
+| `src/th.mjs` | Read-only CLI: `th pool status|usage|accounts`, `th supply status`, `th current`. **Default is cheap** (gateway `/health` → ledger → pool-state). Pass `--live` for full Supabase reconcile. Never prints credentials. |
+| `src/supply.mjs` | **Auto-supply.** Keeps total pool balance ≥ a target by registering fresh accounts *before* the pool runs dry. Measures via gateway health first. |
 | `src/th-supply.mjs` | Entry point for supply (launchd / cron / by hand). |
-| `src/gateway.mjs` | Optional local OpenAI-compatible gateway that borrows a healthy key per request and retires+retries on hard failure **within the same request**. |
-| `src/pool.mjs` | Key-pool state machine behind the gateway (active keys, retirement, persisted state). |
+| `src/gateway.mjs` / `src/th-gateway.mjs` | Local OpenAI-compatible gateway. Borrows a healthy key per request; on hard failure (401/402/403) retires the key (**balance := $0**, ledger event) and retries **within the same request**. `GET /health` is the fast status API. |
+| `src/pool.mjs` | Key-pool state machine behind the gateway (active keys, retirement, persisted state, ledger hooks). |
 | `src/register-browser.mjs` | Browser-driven registration (agent-browser/CDP), an opt-in alternative to the pure-protocol engine. |
 
 ## First-principles design
@@ -53,6 +54,20 @@ wallet (not 402), `401` for a dead key, `429` for quota. Missing the
 `balance_zero` mapping was the root cause of a real outage — exhausted keys
 stayed marked "ok" and kept getting reused. The taxonomy is the contract.
 
+### Balance is an append-only ledger, driven by gateway traffic
+
+Full-fleet Supabase password-grant scans are slow and rate-limited. Instead:
+
+1. **Gateway traffic is the primary signal.** A `402` / `balance_zero` / `401`
+   pins that key to **$0** and appends an `exhausted`/`dead` ledger event.
+   Those keys are never queried again for balance.
+2. **Supply openings** append `open` (+$5 when known) when a new key is adopted.
+3. **CLI / supply default reads** `GET /health` (milliseconds). `th pool status
+   --live` is the explicit reconcile path.
+4. Unknown balances on still-active keys are reported separately and **excluded
+   from the sum** (so totals are a lower bound, which is the safe direction for
+   supply decisions).
+
 ## Paths & configuration
 
 All local paths default to `~/.pi/agent/...` (the machine's Pi integration) but
@@ -78,14 +93,17 @@ node src/th-supply.mjs --dry
 node src/th-supply.mjs --target 100
 
 # query (read-only, --json for machines)
+# default = cheap local/gateway view (ms); add --live for full Supabase scan
 node src/th.mjs pool status
-node src/th.mjs pool usage --json
+node src/th.mjs pool status --live
+node src/th.mjs pool usage --json          # always live (needs tx history)
 node src/th.mjs pool accounts
 node src/th.mjs supply status
 node src/th.mjs current
 
-# optional local gateway
-node src/gateway.mjs        # localhost:8787/v1 (requires a running pool)
+# local gateway (launchd: com.tokenharbor.gateway)
+node src/th-gateway.mjs                    # 127.0.0.1:19672
+curl -s localhost:19672/health | jq '{activeKeys,totalBalance,exhaustedKeys}'
 ```
 
 On macOS, `com.tokenharbor.supply.plist` schedules `th-supply.mjs --target 200`

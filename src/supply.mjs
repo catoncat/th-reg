@@ -42,8 +42,50 @@ function loadUsableAccounts(accountsFile) {
   return [...seen.values()];
 }
 
-/** Sum spendable balance across every account that has a key. */
+/** Cheap gateway /health — preferred over full-fleet Supabase login. */
+async function gatewayHealth() {
+  try {
+    const host = process.env.TH_GATEWAY_HOST || '127.0.0.1';
+    const port = process.env.TH_GATEWAY_PORT || 19672;
+    const base = process.env.TH_GATEWAY_URL || `http://${host}:${port}`;
+    const r = await fetch(`${base}/health`, { signal: AbortSignal.timeout(1500) });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Sum spendable balance across every account that has a key.
+ * Prefers gateway health (exhausted=$0 from live traffic, no Supabase login).
+ * Falls back to serial accountSnapshot only when the gateway is down.
+ */
 async function poolBalance(accounts, log) {
+  const health = await gatewayHealth();
+  if (health && (health.totalKeys > 0 || (health.keys && health.keys.length))) {
+    const byEmail = new Map();
+    for (const k of health.keys || []) {
+      if (k.email) byEmail.set(k.email, k);
+    }
+    let matched = 0;
+    for (const a of accounts) {
+      const k = byEmail.get(a.email);
+      if (!k) continue;
+      matched++;
+      if (k.status === 'exhausted' || k.status === 'dead') a._balance = 0;
+      else if (k.balance != null) a._balance = Number(k.balance) || 0;
+    }
+    const total = Number(health.totalBalance) || 0;
+    const funded = health.activeKeys ?? accounts.filter((a) => (a._balance || 0) > 0.01).length;
+    log(
+      `  via gateway: $${total.toFixed(2)} known across ${funded} active` +
+        ` (${health.unknownBalanceKeys || 0} balance-unknown; ${matched} emails matched)`,
+    );
+    return { total, funded, source: 'gateway', health };
+  }
+
+  log('  gateway unavailable; falling back to live Supabase snapshots (slow)');
   let total = 0;
   let funded = 0;
   for (const a of accounts) {
@@ -58,7 +100,7 @@ async function poolBalance(accounts, log) {
     }
     a._balance = snap.total;
   }
-  return { total, funded };
+  return { total, funded, source: 'live' };
 }
 
 /** Write the current-pointer key file so Pi always reads a funded key. */
@@ -143,15 +185,20 @@ export async function supply({ cfg, targetUsd, lowWatermark, maxAdds = 60, log =
   });
   await allocator.init();
 
-  // 1. measure the pool
+  // 1. measure the pool (gateway health first — no full-fleet login)
   const accounts = loadUsableAccounts(cfg.accountsFile);
   log(`measuring ${accounts.length} account(s) with keys...`);
-  let { total, funded } = await poolBalance(accounts, log);
-  log(`pool: $${total.toFixed(2)} across ${funded} funded account(s) (target $${targetUsd})`);
+  let { total, funded, source: balSource } = await poolBalance(accounts, log);
+  log(`pool: $${total.toFixed(2)} across ${funded} funded account(s) (target $${targetUsd}, source=${balSource || '?'})`);
 
   // 2. keep the current pointer on its account until that account runs low
   const currentKey = existsSync(cfg.currentKeyFile) ? readFileSync(cfg.currentKeyFile, 'utf8').trim() : '';
   const currentAcct = accounts.find((a) => a.api_key === currentKey);
+  // If gateway didn't know this account's balance, do ONE live check (not the fleet).
+  if (currentAcct && currentAcct._balance == null) {
+    const snap = await accountSnapshot(currentAcct.email, currentAcct.password);
+    if (!snap.error) currentAcct._balance = snap.total;
+  }
   const currentBalance = currentAcct?._balance ?? 0;
   if (currentAcct && currentBalance > lowWatermark) {
     log(`current stays ${currentAcct.email} ($${currentBalance.toFixed(2)}; use-to-dregs)`);
