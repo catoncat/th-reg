@@ -317,6 +317,101 @@ function gatewayLogPath() {
   return process.env.TH_GATEWAY_LOG || join(PROJECT_ROOT, 'data', 'gateway.log');
 }
 
+/**
+ * Wall-clock time series. gateway.log has no timestamps, so we attribute
+ * newly-appended lines to the moment we observe them. Bin = fixed seconds.
+ */
+function createSeries({ binMs = 10_000, bins = 60 } = {}) {
+  /** @type {{ t: number, burn: number, fill: number, req: number, bal: number|null }[]} */
+  const buf = [];
+  const binOf = (t) => Math.floor(t / binMs) * binMs;
+
+  const at = (t) => {
+    const key = binOf(t);
+    let last = buf[buf.length - 1];
+    if (!last || last.t !== key) {
+      last = { t: key, burn: 0, fill: 0, req: 0, bal: null };
+      buf.push(last);
+      while (buf.length > bins) buf.shift();
+    }
+    return last;
+  };
+
+  return {
+    /** @param {{ burn?: number, fill?: number, req?: number, bal?: number|null }} d */
+    observe(d, t = Date.now()) {
+      const slot = at(t);
+      if (d.burn) slot.burn += d.burn;
+      if (d.fill) slot.fill += d.fill;
+      if (d.req) slot.req += d.req;
+      if (d.bal != null) slot.bal = d.bal;
+    },
+    mark(t = Date.now()) {
+      at(t);
+    },
+    binMs,
+    all() {
+      return buf.slice();
+    },
+    /** Event-derived rates over the last `mins` minutes: $/min. */
+    ratesOver(mins = 2) {
+      const n = Math.max(1, Math.round((mins * 60_000) / binMs));
+      const win = this.window(n);
+      const burn = win.reduce((s, b) => s + b.burn, 0) / mins;
+      const fill = win.reduce((s, b) => s + b.fill, 0) / mins;
+      const req = win.reduce((s, b) => s + b.req, 0);
+      const seen = win.some((b) => b.burn > 0 || b.fill > 0 || b.req > 0);
+      return seen ? { burn, fill, net: fill - burn, req } : null;
+    },
+
+    /** Last n bins, oldest first, always length n (zero-filled). */
+    window(n) {
+      const now = binOf(Date.now());
+      const map = new Map(buf.map((b) => [b.t, b]));
+      const out = [];
+      for (let i = n - 1; i >= 0; i--) {
+        const t = now - i * binMs;
+        out.push(map.get(t) || { t, burn: 0, fill: 0, req: 0, bal: null });
+      }
+      return out;
+    },
+    spanMin(n) {
+      return (n * binMs) / 60_000;
+    },
+  };
+}
+
+/** Incremental log reader: returns only bytes appended since last call. */
+function createLogFollower(pathFn) {
+  let offset = null;
+  return function readNew() {
+    const path = pathFn();
+    if (!existsSync(path)) return '';
+    let fd;
+    try {
+      fd = openSync(path, 'r');
+      const size = fstatSync(fd).size;
+      if (offset == null) {
+        offset = size; // first tick: baseline only, no backfill storm
+        return '';
+      }
+      if (size < offset) offset = 0; // rotated
+      const len = size - offset;
+      if (len <= 0) return '';
+      const buf = Buffer.alloc(len);
+      readSync(fd, buf, 0, len, offset);
+      offset = size;
+      return buf.toString('utf8');
+    } catch {
+      return '';
+    } finally {
+      if (fd !== undefined) {
+        try { closeSync(fd); } catch { /* ignore */ }
+      }
+    }
+  };
+}
+
 function createRateTracker() {
   const samples = [];
   return {
@@ -360,37 +455,6 @@ function createRateTracker() {
   };
 }
 
-function bar(pct, width, colorize, color) {
-  const p = Math.max(0, Math.min(1, pct));
-  const exact = p * width;
-  const full = Math.floor(exact);
-  const frac = exact - full;
-  const partial = frac >= 0.5 ? '▌' : '';
-  const on = '='.repeat(full) + (partial ? '=' : '');
-  // Use '=' / '-' — universally monospaced, no font blob for █
-  const filled = Math.min(width, Math.round(p * width));
-  const on2 = '='.repeat(filled);
-  const off2 = '-'.repeat(Math.max(0, width - filled));
-  return colorize(color, on2) + colorize(ansi.gray, off2);
-}
-
-function sparkline(samples, width, colorize) {
-  if (!samples || samples.length < 2 || width < 8) return colorize(ansi.dim, '·'.repeat(width));
-  const vals = samples.map((s) => s.bal);
-  const min = Math.min(...vals);
-  const max = Math.max(...vals);
-  const span = max - min || 1;
-  const blocks = '▁▂▃▄▅▆▇█';
-  // take last `width` samples (resample if needed)
-  const out = [];
-  for (let x = 0; x < width; x++) {
-    const idx = Math.floor((x / Math.max(1, width - 1)) * (vals.length - 1));
-    const v = vals[idx];
-    const t = (v - min) / span;
-    out.push(blocks[Math.min(7, Math.floor(t * 7))]);
-  }
-  return colorize(ansi.dim, out.join(''));
-}
 
 function money(n) {
   if (n == null || Number.isNaN(n)) return '$—';
@@ -419,11 +483,6 @@ function moneyFine(n) {
   return sign + '$' + Math.abs(n).toFixed(2);
 }
 
-function truncEmail(email, n = 28) {
-  if (!email) return '…';
-  if (email.length <= n) return email;
-  return email.slice(0, n - 1) + '…';
-}
 
 function fmtDur(sec) {
   if (sec == null || !Number.isFinite(sec) || sec < 0) return null;
@@ -444,7 +503,6 @@ function ageSec(at) {
 }
 
 
-
 function padVisible(s, width) {
   const v = stripAnsi(s).length;
   if (v === width) return s;
@@ -452,22 +510,158 @@ function padVisible(s, width) {
   return s + ' '.repeat(width - v);
 }
 
-/** Side-by-side columns; gap is plain spaces (no box drawing). */
-function zipColumns(leftLines, rightLines, leftW, totalW, gap = 3) {
-  const rightW = Math.max(12, totalW - leftW - gap);
-  const n = Math.max(leftLines.length, rightLines.length, 1);
-  const out = [];
-  const sp = ' '.repeat(gap);
-  for (let i = 0; i < n; i++) {
-    out.push(padVisible(leftLines[i] || '', leftW) + sp + padVisible(rightLines[i] || '', rightW));
+
+/** Pool composition from /health keys (fact buckets, no identity). */
+function poolComposition(health) {
+  const keys = health.keys || [];
+  let fresh = 0;
+  let partial = 0;
+  let zero = 0;
+  let unknown = 0;
+  for (const k of keys) {
+    const b = k.balance;
+    if (b == null || Number.isNaN(b)) unknown++;
+    else if (b <= 0.01) zero++;
+    else if (b >= 4.99) fresh++;
+    else partial++;
   }
+  if (!keys.length) {
+    return {
+      fresh: 0,
+      partial: health.activeKeys || 0,
+      zero: health.exhaustedKeys || 0,
+      unknown: health.unknownBalanceKeys || 0,
+      live: health.activeKeys || 0,
+      used: health.usedKeys,
+      total: health.totalKeys || 0,
+    };
+  }
+  return {
+    fresh,
+    partial,
+    zero,
+    unknown,
+    live: health.activeKeys || 0,
+    used: health.usedKeys,
+    total: health.totalKeys || keys.length,
+  };
+}
+
+// ── Visual vocabulary: one shape per meaning ───────────────
+//   progress  ▰▱   pool level toward target
+//   share     █░   proportion of a whole (models, key mix)
+//   flow      ▐    opposed rate meters (burn vs fill)
+//   time      ⠿    braille dual-line chart over a real axis
+
+/** Share bar: solid vs light, for "part of a whole". */
+function shareBar(frac, width, c, color) {
+  const n = Math.max(0, Math.min(width, Math.round(frac * width)));
+  return c(color, '█'.repeat(n)) + c(ansi.gray, '░'.repeat(width - n));
+}
+
+/** Progress bar: pool level. Distinct glyphs from share. */
+function progressBar(frac, width, c, color) {
+  const n = Math.max(0, Math.min(width, Math.round(frac * width)));
+  return c(color, '▰'.repeat(n)) + c(ansi.gray, '▱'.repeat(width - n));
+}
+
+/** Stacked composition bar: full / partial / empty in one strip. */
+function stackBar(parts, width, c) {
+  const total = parts.reduce((s, p) => s + p.n, 0) || 1;
+  let used = 0;
+  let out = '';
+  parts.forEach((p, i) => {
+    let n = i === parts.length - 1 ? width - used : Math.round((p.n / total) * width);
+    n = Math.max(0, Math.min(width - used, n));
+    used += n;
+    out += c(p.color, p.glyph.repeat(n));
+  });
   return out;
 }
 
 /**
- * Pool ops moods — burn vs fill first, supply second.
- * EMPTY | STALLED | DRAINING | REFILLING | RECOVERING | BALANCED | HEALTHY | DOWN
+ * Braille dual-line chart with real time axis.
+ * Two series share one vertical scale so burn vs fill is directly comparable.
  */
+/**
+ * Two stacked mini-charts sharing one time axis.
+ * burn (continuous) and fill (lumpy +$5 grants) have different natural
+ * magnitudes, so each gets its own vertical scale; the shared axis is time.
+ */
+function dualChart(series, width, height, c) {
+  const w = Math.max(8, width);
+  const cells = w * 2;
+  const win = series.window(cells);
+  const perMin = 60_000 / series.binMs;
+  const burnVals = win.map((b) => b.burn * perMin);
+  const fillVals = win.map((b) => b.fill * perMin);
+
+  const laneH = Math.max(1, Math.floor((Math.max(2, height) - 1) / 2));
+
+  const lane = (vals, name, color) => {
+    const peak = Math.max(...vals, 0.0001);
+    const dotRows = laneH * 4;
+    const grid = Array.from({ length: laneH }, () => new Array(w).fill(0));
+    for (let i = 0; i < cells; i++) {
+      const v = vals[i] || 0;
+      if (v <= 0) continue;
+      const level = Math.min(dotRows - 1, Math.round((v / peak) * (dotRows - 1)));
+      const col = Math.floor(i / 2);
+      const half = i % 2;
+      const row = laneH - 1 - Math.floor(level / 4);
+      const dotIdx = level % 4;
+      const bits = half === 0 ? [0x40, 0x04, 0x02, 0x01] : [0x80, 0x20, 0x10, 0x08];
+      grid[row][col] |= bits[3 - dotIdx];
+    }
+    const lines = [];
+    for (let r = 0; r < laneH; r++) {
+      let body = '';
+      for (let x = 0; x < w; x++) {
+        const mask = grid[r][x];
+        body += mask ? String.fromCharCode(0x2800 + mask) : ' ';
+      }
+      let line = c(color, body);
+      if (r === 0) {
+        const hasData = vals.some((v) => v > 0);
+        line += c(ansi.dim, '  ' + (hasData ? moneyFine(peak) + '/m' : '—'));
+      }
+      lines.push(line);
+    }
+    return lines.map((l, i) =>
+      c(ansi.dim, (i === lines.length - 1 ? name : '').padEnd(5)) + l,
+    );
+  };
+
+  const out = [];
+  for (const l of lane(burnVals, 'burn', ansi.red)) out.push(l);
+  for (const l of lane(fillVals, 'fill', ansi.green)) out.push(l);
+
+  const spanMin = series.spanMin(cells);
+  const ticks = Math.max(2, Math.min(5, Math.floor(w / 14)));
+  let axisLine = '';
+  let cursor = 0;
+  for (let i = 0; i < ticks; i++) {
+    const frac = i / (ticks - 1);
+    const pos = Math.round(frac * (w - 1));
+    const minsAgo = spanMin * (1 - frac);
+    const label =
+      i === ticks - 1
+        ? 'now'
+        : '-' + (minsAgo >= 1 ? Math.round(minsAgo) + 'm' : Math.round(minsAgo * 60) + 's');
+    const target = Math.min(pos, w - label.length);
+    if (target > cursor) {
+      axisLine += ' '.repeat(target - cursor);
+      cursor = target;
+    }
+    if (cursor <= w - label.length) {
+      axisLine += label;
+      cursor += label.length;
+    }
+  }
+  out.push(c(ansi.dim, ' '.repeat(5) + axisLine));
+  return out;
+}
+
 function classify({ health, ld, supply, rates }) {
   if (!health.ok) return 'DOWN';
   const bal = health.totalBalance;
@@ -482,704 +676,264 @@ function classify({ health, ld, supply, rates }) {
   if (active === 0 && bal < 0.5) return 'EMPTY';
   if (running && fails >= 4) return 'STALLED';
   if (active > 0 && bal < target * 0.05 && running) return 'RECOVERING';
-  if (running && bal < target) return 'REFILLING';
-  if (
-    (net != null && net < -1 && fill < burn * 0.4) ||
-    (bal < target && !running && net != null && net < -0.2)
-  ) {
-    return 'DRAINING';
+
+  // Net outflow is normal at a healthy level — supply only tops up on demand.
+  // Draining is a warning about the level, not about momentary direction.
+  const runway = net != null && net < -0.05 ? (bal / Math.abs(net)) * 60 : Infinity;
+  const lowLevel = bal < target * 0.9;
+  const shortRunway = runway < 20 * 60; // under ~20 minutes of headroom
+  if (lowLevel && shortRunway && fill < burn * 0.4) return 'DRAINING';
+
+  if (running && bal < target * 0.98) return 'REFILLING';
+  if (bal >= target * 0.98) {
+    if (net != null && net < -0.05 && burn > 0.5) return 'BALANCED';
+    return 'HEALTHY';
   }
-  if (bal >= target && active > 0) {
-    if (net != null && Math.abs(net) < 2 && burn > 0.5) return 'BALANCED';
-    if (!running || (supply.targetGap != null && supply.targetGap <= 0)) return 'HEALTHY';
-    return 'BALANCED';
-  }
-  if (running || bal < target) return 'REFILLING';
-  return 'HEALTHY';
+  return 'REFILLING';
 }
 
-function conclusion({ mood, health, ld, supply, rates }) {
+/** Verdict: one sentence, one supporting clause. Never repeated elsewhere. */
+function conclusion({ mood, health, ld, rates, supply }) {
   const target = ld.targetUsd || 1000;
   const bal = health.ok ? health.totalBalance : 0;
   const net = rates?.net;
-  const burn = rates?.burn;
-  const fill = rates?.fill;
 
-  const netStr =
-    net == null
-      ? null
-      : (net >= 0 ? 'net +' : 'net ') + moneyFine(net).replace('$-', '-') + '/min';
-
-  if (mood === 'DOWN') {
-    return { title: 'GATEWAY DOWN', sub: health.error || 'unreachable', color: ansi.red };
-  }
-  if (mood === 'EMPTY') {
-    return {
-      title: 'EMPTY · requests will 503',
-      sub: ld.running
-        ? 'supply engaged · first live key ~60–90s'
-        : 'supply not running · kick com.tokenharbor.supply',
-      color: ansi.red,
-    };
-  }
-  if (mood === 'STALLED') {
-    return {
-      title: 'STALLED · supply failing',
-      sub: 'fail streak ' + supply.failStreak + ' · captcha/proxy/mail?',
-      color: ansi.red,
-    };
-  }
-  if (mood === 'DRAINING') {
-    const parts = ['DRAINING'];
-    if (netStr) parts.push(netStr);
-    if (net != null && net < -0.05 && bal > 0) {
-      parts.push('~' + fmtDur((bal / Math.abs(net)) * 60) + ' to 503');
-    }
-    return {
-      title: parts.join(' · '),
-      sub: [
-        burn != null ? 'burn ' + moneyFine(burn) + '/min' : null,
-        fill != null && fill > 0 ? 'fill ' + moneyFine(fill) + '/min' : 'fill idle',
-      ]
-        .filter(Boolean)
-        .join(' · '),
-      color: ansi.yellow,
-    };
-  }
-  if (mood === 'RECOVERING') {
-    return {
-      title: 'RECOVERING · ' + moneyBook(bal) + ' · ' + health.activeKeys + ' live',
-      sub: netStr ? netStr + ' · climbing out of empty' : 'supply engaged',
-      color: ansi.yellow,
-    };
-  }
-  if (mood === 'REFILLING') {
-    const parts = ['REFILLING'];
-    if (netStr) parts.push(netStr);
-    if (net != null && net > 0.05 && bal < target) {
-      parts.push('clear in ' + fmtDur(((target - bal) / net) * 60));
-    } else if (bal < target) {
-      parts.push(moneyBook(target - bal) + ' below');
-    }
-    return {
-      title: parts.join(' · '),
-      sub: [
-        supply.added != null ? '+' + supply.added + ' this run' : null,
-        health.activeKeys + ' live',
-      ]
-        .filter(Boolean)
-        .join(' · '),
-      color: ansi.yellow,
-    };
-  }
-  if (mood === 'BALANCED') {
-    return {
-      title: 'BALANCED · ' + (netStr || 'steady') + ' · ' + moneyBook(bal),
-      sub:
-        (burn != null ? 'burn ' + moneyFine(burn) + '/min' : 'burn …') +
-        ' · ' +
-        (fill != null ? 'fill ' + moneyFine(fill) + '/min' : 'fill …'),
-      color: ansi.green,
-    };
-  }
-  return {
-    title: 'HEALTHY · ' + moneyBook(bal) + ' · ' + health.activeKeys + ' live',
-    sub: ld.running ? 'above target · supply winding down' : 'above target · supply idle',
-    color: ansi.green,
+  const eta = () => {
+    if (net == null) return null;
+    if (net < -0.05 && bal > 0) return 'dry in ' + fmtDur((bal / Math.abs(net)) * 60);
+    if (net > 0.05 && bal < target) return 'full in ' + fmtDur(((target - bal) / net) * 60);
+    return null;
   };
+
+  switch (mood) {
+    case 'DOWN':
+      return { title: 'GATEWAY DOWN', sub: health.error || 'unreachable', color: ansi.red };
+    case 'EMPTY':
+      return {
+        title: 'EMPTY',
+        sub: ld.running ? 'supply engaged · first key ~60s' : 'supply idle · needs a kick',
+        color: ansi.red,
+      };
+    case 'STALLED':
+      return {
+        title: 'STALLED',
+        sub: 'supply failing ×' + supply.failStreak + ' · captcha / mail / proxy',
+        color: ansi.red,
+      };
+    case 'DRAINING':
+      return { title: 'DRAINING', sub: eta() || 'burn outpacing fill', color: ansi.yellow };
+    case 'RECOVERING':
+      return { title: 'RECOVERING', sub: eta() || 'climbing out of empty', color: ansi.yellow };
+    case 'REFILLING':
+      return { title: 'REFILLING', sub: eta() || 'supply working', color: ansi.yellow };
+    case 'BALANCED': {
+      const runway =
+        rates?.net != null && rates.net < -0.05
+          ? 'headroom ' + fmtDur((bal / Math.abs(rates.net)) * 60)
+          : 'holding';
+      return { title: 'AT TARGET', sub: runway + ' · supply tops up on demand', color: ansi.green };
+    }
+    default:
+      return {
+        title: 'HEALTHY',
+        sub: bal >= target ? 'at or above target' : 'comfortable level',
+        color: ansi.green,
+      };
+  }
 }
 
 function stageLabel(stage) {
   const map = {
-    signup: 'signup ',
+    signup: 'signup',
     mail: 'mailbox',
-    verify: 'verify ',
+    verify: 'verify',
     opening: 'opening',
-    done: 'done   ',
-    fail: 'fail   ',
-    dns: 'dns    ',
-    idle: 'idle   ',
+    done: 'done',
+    fail: 'fail',
+    dns: 'dns',
+    idle: 'idle',
   };
-  return map[stage] || (stage + '       ').slice(0, 7);
-}
-
-function rateBar(value, maxRef, width, colorize, color) {
-  const max = Math.max(maxRef, 0.01);
-  const pct = Math.max(0, Math.min(1, (value || 0) / max));
-  const filled = Math.round(pct * width);
-  return colorize(color, '='.repeat(filled)) + colorize(ansi.gray, '-'.repeat(Math.max(0, width - filled)));
-}
-
-/** Build left column: model burn breakdown. */
-
-/** Pool composition from /health keys (fact buckets, no identity). */
-function poolComposition(health) {
-  const keys = health.keys || [];
-  let fresh = 0; // ~$5 unburned
-  let partial = 0;
-  let zero = 0;
-  let unknown = 0;
-  for (const k of keys) {
-    const b = k.balance;
-    if (b == null || Number.isNaN(b)) unknown++;
-    else if (b <= 0.01) zero++;
-    else if (b >= 4.99) fresh++;
-    else partial++;
-  }
-  // if keys array absent, fall back to counters
-  if (!keys.length) {
-    return {
-      fresh: null,
-      partial: null,
-      zero: health.exhaustedKeys || 0,
-      unknown: health.unknownBalanceKeys || 0,
-      live: health.activeKeys || 0,
-      used: health.usedKeys,
-      total: health.totalKeys || 0,
-      dead: health.deadKeys || 0,
-      quota: health.quotaKeys || 0,
-    };
-  }
-  return {
-    fresh,
-    partial,
-    zero,
-    unknown,
-    live: health.activeKeys || 0,
-    used: health.usedKeys,
-    total: health.totalKeys || keys.length,
-    dead: health.deadKeys || 0,
-    quota: health.quotaKeys || 0,
-  };
-}
-
-/** Build burn-by-model lines (dense single row each). */
-function renderBurnCol(ctx, width) {
-  const { gateway, rates, c } = ctx;
-  const lines = [];
-  lines.push(c(ansi.dim, 'BURN BY MODEL'));
-
-  const byModel = gateway?.byModel || {};
-  const rows = Object.entries(byModel)
-    .map(([model, v]) => ({ model, amount: v.amount, count: v.count }))
-    .sort((a, b) => b.amount - a.amount);
-
-  const total = rows.reduce((s, r) => s + r.amount, 0) || gateway?.totalSpend || 0;
-  const burn = rates?.burn;
-  const fill = rates?.fill;
-  const reqs = rows.reduce((s, r) => s + r.count, 0);
-
-  if (!rows.length) {
-    lines.push(c(ansi.dim, 'no spend in log window'));
-  } else {
-    const nameW = Math.min(12, Math.max(8, Math.floor(width * 0.28)));
-    const moneyW = 9;
-    const metaW = 11; // avg
-    const barW = Math.max(4, width - nameW - moneyW - metaW - 8);
-
-    for (const r of rows.slice(0, 10)) {
-      const pct = total > 0 ? r.amount / total : 0;
-      const name = padVisible(shortModel(r.model), nameW);
-      const amt = ('−' + moneyFine(r.amount)).padStart(moneyW);
-      const avg = r.count ? r.amount / r.count : 0;
-      const meta = (r.count + '× ~' + moneyFine(avg)).padStart(metaW + 4).slice(-metaW - 2);
-      const b = rateBar(r.amount, total, barW, c, ansi.red);
-      lines.push(
-        c(ansi.bold, name) +
-          c(ansi.dim, amt) +
-          ' ' +
-          b +
-          ' ' +
-          c(ansi.dim, meta),
-      );
-    }
-    if (rows.length > 10) lines.push(c(ansi.dim, '+' + (rows.length - 10) + ' models'));
-  }
-
-  // compact totals under models
-  const bits = [];
-  if (total > 0) bits.push('win −' + moneyFine(total));
-  if (reqs) bits.push(reqs + ' req');
-  if (burn != null) bits.push('−' + moneyFine(burn) + '/min');
-  if (bits.length) lines.push(c(ansi.dim, bits.join(' · ')));
-  return lines;
-}
-
-/** Rates column: burn/fill bars + headroom. */
-function renderFlowCol(ctx, width) {
-  const { rates, health, ld, sessionStartBal, rateSamples, c } = ctx;
-  const lines = [];
-  lines.push(c(ansi.dim, 'FLOW'));
-
-  const burn = rates?.burn;
-  const fill = rates?.fill;
-  const net = rates?.net;
-  const target = ld.targetUsd || 1000;
-  const bal = health.ok ? health.totalBalance : 0;
-  const ref = Math.max(burn || 0, fill || 0, Math.abs(net || 0), 1);
-  const barW = Math.max(6, width - 16);
-
-  const burnStr = burn == null ? '…' : ('−' + moneyFine(burn)).padStart(8);
-  const fillStr = fill == null ? '…' : ('+' + moneyFine(fill)).padStart(8);
-  const netStr =
-    net == null ? '…' : ((net >= 0 ? '+' : '') + moneyFine(net)).padStart(8);
-
-  lines.push(
-    c(ansi.red, 'burn') +
-      ' ' +
-      c(ansi.dim, burnStr) +
-      ' ' +
-      rateBar(burn || 0, ref, barW, c, ansi.red),
-  );
-  lines.push(
-    c(ansi.green, 'fill') +
-      ' ' +
-      c(ansi.dim, fillStr) +
-      ' ' +
-      rateBar(fill || 0, ref, barW, c, ansi.green),
-  );
-  lines.push(c(ansi.dim, 'net  ' + netStr + '/min'));
-
-  // headroom / clear
-  if (net != null && net < -0.05 && bal > 0) {
-    lines.push(c(ansi.yellow, '503 in ~' + fmtDur((bal / Math.abs(net)) * 60)));
-  } else if (net != null && net > 0.05 && bal < target) {
-    lines.push(c(ansi.dim, 'clear ~' + fmtDur(((target - bal) / net) * 60)));
-  } else if (net != null && Math.abs(net) <= 0.05) {
-    lines.push(c(ansi.dim, 'flat · holding'));
-  } else {
-    lines.push(c(ansi.dim, 'rate warming…'));
-  }
-
-  if (sessionStartBal != null && Number.isFinite(sessionStartBal)) {
-    const d = bal - sessionStartBal;
-    if (Math.abs(d) >= 0.005) {
-      lines.push(c(ansi.dim, 'session ' + (d >= 0 ? '+' : '') + moneyBook(d)));
-    }
-  }
-
-  // mini spark if room
-  if (rateSamples && rateSamples.length >= 2 && width >= 16) {
-    lines.push(sparkline(rateSamples, Math.min(width, 28), c));
-  }
-
-  return lines;
-}
-
-/** Supply column. */
-function renderSupplyCol(ctx, width) {
-  const { ld, supply, c } = ctx;
-  const lines = [];
-  lines.push(c(ansi.dim, 'SUPPLY'));
-
-  if (!ld.loaded) {
-    lines.push(c(ansi.dim, 'launchd not loaded'));
-    return lines;
-  }
-
-  if (!ld.running) {
-    lines.push(c(ansi.dim, 'idle · next ≤60s'));
-    if (ld.targetUsd) lines.push(c(ansi.dim, 'target ' + money(ld.targetUsd)));
-    if (supply.added != null && supply.added > 0) {
-      lines.push(c(ansi.dim, 'last +' + supply.added + (supply.maxAdds != null ? '/' + supply.maxAdds : '')));
-    }
-    if (supply.failStreak) lines.push(c(ansi.red, 'fail streak ' + supply.failStreak));
-    return lines;
-  }
-
-  const ws = supply.workers || [];
-  if (!ws.length) {
-    lines.push(c(ansi.dim, 'workers starting…'));
-  } else {
-    for (const wk of ws) {
-      const age = ageSec(wk.at);
-      const ageStr =
-        wk.stage === 'done' ? wk.detail || '+$5' : age != null ? fmtAge(age) : '';
-      const stageColor =
-        wk.stage === 'done'
-          ? ansi.green
-          : wk.stage === 'fail'
-            ? ansi.red
-            : wk.stage === 'opening'
-              ? ansi.yellow
-              : null;
-      const showId =
-        wk.stage === 'mail' ||
-        wk.stage === 'verify' ||
-        wk.stage === 'signup' ||
-        wk.stage === 'opening';
-      const id =
-        showId && wk.email ? truncEmail(wk.email, Math.max(6, width - 16)) : '';
-      const left =
-        c(ansi.dim, 'w' + wk.id) + ' ' + c(stageColor, stageLabel(wk.stage).trim());
-      const mid = id ? ' ' + id : '';
-      const padn = Math.max(1, width - stripAnsi(left + mid).length - String(ageStr).length);
-      lines.push(left + mid + ' '.repeat(padn) + c(ansi.dim, String(ageStr)));
-    }
-  }
-
-  const bits = [];
-  if (supply.added != null) bits.push('+' + supply.added + ' run');
-  if (supply.maxAdds != null && supply.added != null) bits.push(supply.added + '/' + supply.maxAdds);
-  if (supply.failStreak) bits.push(c(ansi.red, 'fail×' + supply.failStreak));
-  if (ld.pid) bits.push('pid ' + ld.pid);
-  // bits may contain ansi from fail - join carefully
-  if (supply.added != null || supply.failStreak || ld.pid) {
-    const plain = [];
-    if (supply.added != null) {
-      plain.push(
-        '+' +
-          supply.added +
-          (supply.maxAdds != null ? '/' + supply.maxAdds : '') +
-          ' run',
-      );
-    }
-    if (supply.failStreak) plain.push('fail×' + supply.failStreak);
-    if (ld.pid) plain.push('pid ' + ld.pid);
-    lines.push(c(ansi.dim, plain.join(' · ')));
-  }
-
-  // recent funded rate from supply.recent
-  const funded = (supply.recent || []).filter((e) => e.kind === 'funded').length;
-  const fails = (supply.recent || []).filter((e) => e.kind === 'fail').length;
-  if (funded || fails) {
-    lines.push(
-      c(ansi.dim, 'log ') +
-        (funded ? c(ansi.green, 'fund×' + funded) : '') +
-        (funded && fails ? c(ansi.dim, ' ') : '') +
-        (fails ? c(ansi.red, 'fail×' + fails) : ''),
-    );
-  }
-  return lines;
+  return map[stage] || stage;
 }
 
 /**
- * Layout denser:
- *   hero mood
- *   money + bar + composition (multi KPI lines)
- *   3-col when wide: BURN | FLOW | SUPPLY
- *   PULSE fills ALL leftover rows (dense ticket tape, no emails)
+ * Layout — one subject per band, top to bottom by eye priority:
+ *   1 MONEY      the number, its direction, its deadline
+ *   2 FLOW       burn vs fill, opposed meters on a shared scale
+ *   3 TIME       dual-line chart with a real axis   ← the missing piece
+ *   4 MODELS     share of burn + unit price
+ *   5 KEYS       stacked composition, one strip
+ *   6 SUPPLY     one line idle, worker rows only when busy
  */
 function renderGlance(ctx) {
-  const {
-    health,
-    ld,
-    supply,
-    rates,
-    netPerMin,
-    now,
-    cols,
-    rows,
-    sessionStartBal,
-    gateway,
-    rateSamples,
-  } = ctx;
+  const { health, ld, supply, rates, netPerMin, now, cols, rows, sessionStartBal, gateway, series } = ctx;
   const tty = ctx.tty;
   const c = (code, s) => paint(tty, code, s);
   const rateObj = rates || { net: netPerMin };
   const mood = classify({ ...ctx, rates: rateObj });
   const head = conclusion({ ...ctx, mood, rates: rateObj });
+
   const target = ld.targetUsd || 1000;
   const bal = health.ok ? health.totalBalance : 0;
-  const pct = target > 0 ? bal / target : 0;
+  const pct = target > 0 ? Math.min(1, bal / target) : 0;
   const net = rateObj?.net ?? netPerMin;
+  const burn = rateObj?.burn;
+  const fill = rateObj?.fill;
   const comp = health.ok ? poolComposition(health) : null;
 
-  const gutter = 1;
-  const W = Math.max(40, cols - gutter * 2);
+  const gutter = 2;
+  const W = Math.max(44, cols - gutter * 2);
   const pad = (s) => ' '.repeat(gutter) + s;
   const out = [];
   const add = (s = '') => out.push(s.length ? pad(s) : '');
 
-  // ── HERO ────────────────────────────────────────────────
-  add(c(ansi.bold, c(head.color, head.title)));
-  if (head.sub) add(c(ansi.dim, head.sub));
+  const accent =
+    mood === 'EMPTY' || mood === 'STALLED' || mood === 'DOWN'
+      ? ansi.red
+      : mood === 'HEALTHY' || mood === 'BALANCED'
+        ? ansi.green
+        : ansi.yellow;
 
-  if (mood === 'DOWN') {
+  // ── 1 MONEY ──────────────────────────────────────────────
+  add('');
+  if (!health.ok) {
+    add(c(ansi.bold, c(ansi.red, 'GATEWAY DOWN')) + c(ansi.dim, '   ' + (health.error || '')));
     add('');
     add(c(ansi.dim, 'launchctl kickstart gui/$(id -u)/com.tokenharbor.gateway'));
   } else {
-    // money line
-    const balColor =
-      mood === 'EMPTY' ? ansi.red : mood === 'HEALTHY' || mood === 'BALANCED' ? ansi.green : ansi.bold;
+    const big = moneyBook(bal);
+    const dir = net == null ? '' : net >= 0 ? '▲' : '▼';
+    const dirColor = net == null ? ansi.dim : net >= 0 ? ansi.green : ansi.red;
+    const rate = net == null ? 'measuring' : moneyFine(Math.abs(net)) + '/min';
     add(
-      c(balColor, moneyBook(bal)) +
-        c(ansi.dim, ' / ' + money(target)) +
-        c(ansi.dim, '  ·  ' + Math.round(pct * 100) + '%'),
+      c(ansi.bold, c(accent, big)) +
+        c(ansi.dim, '  of ' + money(target) + '   ') +
+        c(dirColor, dir + ' ' + rate),
     );
-
-    const barColor =
-      mood === 'EMPTY'
-        ? ansi.red
-        : mood === 'HEALTHY' || mood === 'BALANCED'
-          ? ansi.green
-          : ansi.yellow;
-    // bar + spark on same visual band when wide
-    if (W >= 70 && rateSamples && rateSamples.length >= 2) {
-      const sparkW = Math.min(24, Math.floor(W * 0.25));
-      const barW = W - sparkW - 1;
-      add(bar(pct, barW, c, barColor) + ' ' + sparkline(rateSamples, sparkW, c));
-    } else {
-      add(bar(pct, W, c, barColor));
-    }
-
-    // composition — the density the screenshot was missing
-    if (comp) {
-      const parts = [];
-      parts.push(comp.live + ' live');
-      if (comp.partial != null) parts.push(comp.partial + ' mid');
-      if (comp.fresh != null) parts.push(comp.fresh + ' full');
-      parts.push((comp.zero || 0) + '∅');
-      if (comp.dead) parts.push(comp.dead + ' dead');
-      if (comp.quota) parts.push(comp.quota + ' quota');
-      if (comp.used != null) parts.push(comp.used + ' used');
-      parts.push(comp.total + ' keys');
-      if (health.ledgerSeq != null) parts.push('#' + health.ledgerSeq);
-      add(c(ansi.dim, parts.join(' · ')));
-    }
-
-    // session / net / burn / fill one KPI strip
-    {
-      const bits = [];
-      if (sessionStartBal != null && Number.isFinite(sessionStartBal)) {
-        const d = bal - sessionStartBal;
-        if (Math.abs(d) >= 0.005) bits.push('sess ' + (d >= 0 ? '+' : '') + moneyBook(d));
-      }
-      if (rateObj?.burn != null) bits.push('burn −' + moneyFine(rateObj.burn) + '/m');
-      if (rateObj?.fill != null) bits.push('fill +' + moneyFine(rateObj.fill) + '/m');
-      if (net != null) bits.push('net ' + (net >= 0 ? '+' : '') + moneyFine(net) + '/m');
-      if (gateway?.totalSpend) bits.push('win −' + moneyFine(gateway.totalSpend));
-      const reqs = gateway?.byModel
-        ? Object.values(gateway.byModel).reduce((s, v) => s + (v.count || 0), 0)
-        : 0;
-      if (reqs) bits.push(reqs + ' req');
-      if (bits.length) add(c(ansi.dim, bits.join('  ·  ')));
-    }
-
+    add(
+      c(ansi.bold, c(accent, head.title)) + c(ansi.dim, '  ' + head.sub),
+    );
+    add(progressBar(pct, W, c, accent) + c(ansi.dim, ' ' + Math.round(pct * 100) + '%'));
     add('');
 
-    // ── MAIN columns ──────────────────────────────────────
-    // wide (≥100): 3-col burn | flow | supply
-    // mid  (≥72): 2-col burn | supply, flow folded into hero already
-    // narrow: stack
-    if (W >= 100) {
-      const g = 2;
-      const c1 = Math.floor(W * 0.42);
-      const c2 = Math.floor(W * 0.28);
-      const c3 = W - c1 - c2 - g * 2;
-      const L = renderBurnCol({ gateway, rates: rateObj, c }, c1);
-      const M = renderFlowCol(
-        { rates: rateObj, health, ld, sessionStartBal, rateSamples, c },
-        c2,
+    // ── 2 FLOW: opposed meters on a stable, historical scale ──
+    // Scaling to max(burn, fill) alone pins the larger bar at 100% forever.
+    // Anchor to the recent peak so the bars encode magnitude, not just rank.
+    const hist = series ? series.window(200) : [];
+    const perMinHist = series ? 60_000 / series.binMs : 1;
+    const histPeak = hist.length
+      ? Math.max(...hist.map((b) => Math.max(b.burn, b.fill) * perMinHist))
+      : 0;
+    const scale = Math.max(burn || 0, fill || 0, histPeak, 0.01);
+    const meterW = Math.max(10, Math.floor(W * 0.45));
+    const fmtRate = (v, sign) => (v == null ? '  measuring' : (sign + moneyFine(v) + '/m').padStart(11));
+    add(
+      c(ansi.dim, 'burn ') +
+        c(ansi.red, fmtRate(burn, '−')) +
+        '  ' +
+        shareBar(burn == null ? 0 : burn / scale, meterW, c, ansi.red),
+    );
+    add(
+      c(ansi.dim, 'fill ') +
+        c(ansi.green, fmtRate(fill, '+')) +
+        '  ' +
+        shareBar(fill == null ? 0 : fill / scale, meterW, c, ansi.green),
+    );
+    add('');
+
+    // ── 3 TIME: the axis this panel was missing ────────────
+    if (series) {
+      const chartH = W >= 80 ? 4 : 3;
+      const chartW = Math.max(20, W - 14);
+      const observed = series.all().some((b) => b.burn > 0 || b.fill > 0);
+      add(
+        c(ansi.dim, 'burn / fill over time') +
+          (observed ? '' : c(ansi.dim, '   collecting — needs ~1 min of traffic')),
       );
-      const R = renderSupplyCol({ ld, supply, c }, c3);
-      const n = Math.max(L.length, M.length, R.length);
-      for (let i = 0; i < n; i++) {
+      for (const line of dualChart(series, chartW, chartH, c)) add(line);
+      add('');
+    }
+
+    // ── 4 MODELS: share of burn + unit price ───────────────
+    const byModel = gateway?.byModel || {};
+    const mrows = Object.entries(byModel)
+      .map(([model, v]) => ({ model, amount: v.amount, count: v.count }))
+      .sort((a, b) => b.amount - a.amount);
+    const mtotal = mrows.reduce((s, r) => s + r.amount, 0);
+    if (mrows.length) {
+      const barW = Math.max(8, Math.floor(W * 0.3));
+      for (const r of mrows.slice(0, 4)) {
+        const frac = mtotal > 0 ? r.amount / mtotal : 0;
         add(
-          padVisible(L[i] || '', c1) +
-            ' '.repeat(g) +
-            padVisible(M[i] || '', c2) +
-            ' '.repeat(g) +
-            padVisible(R[i] || '', c3),
-        );
-      }
-    } else if (W >= 72) {
-      const g = 3;
-      const c1 = Math.floor(W * 0.58);
-      const c2 = W - c1 - g;
-      const L = renderBurnCol({ gateway, rates: rateObj, c }, c1);
-      const R = renderSupplyCol({ ld, supply, c }, c2);
-      // inject flow summary at top of right if supply short
-      const flowBits = renderFlowCol(
-        { rates: rateObj, health, ld, sessionStartBal, rateSamples: null, c },
-        c2,
-      );
-      // merge: flow first lines then supply (skip duplicate header spacing)
-      const right = [...flowBits, '', ...R];
-      const n = Math.max(L.length, right.length);
-      for (let i = 0; i < n; i++) {
-        add(padVisible(L[i] || '', c1) + ' '.repeat(g) + padVisible(right[i] || '', c2));
-      }
-    } else {
-      for (const line of renderBurnCol({ gateway, rates: rateObj, c }, W)) add(line);
-      add('');
-      for (const line of renderFlowCol(
-        { rates: rateObj, health, ld, sessionStartBal, rateSamples, c },
-        W,
-      ))
-        add(line);
-      add('');
-      for (const line of renderSupplyCol({ ld, supply, c }, W)) add(line);
-    }
-  }
-
-  // ── PULSE + STATS: fill leftover without email spam ─────
-  const footerReserve = 1;
-  const leftover = Math.max(0, rows - footerReserve - out.length);
-
-  if (mood !== 'DOWN' && leftover >= 2) {
-    add('');
-    add(c(ansi.dim, 'ACTIVITY'));
-    let budget = Math.max(1, rows - footerReserve - out.length);
-    const lines = [];
-    const recent = gateway?.recent || [];
-    const spends = recent.filter((e) => e.kind === 'spend');
-
-    // chips
-    let fundedN = 0;
-    let failN = 0;
-    for (const ev of supply.recent || []) {
-      if (ev.kind === 'funded') fundedN++;
-      if (ev.kind === 'fail') failN++;
-    }
-    const exhN = recent.filter((e) => e.kind === 'exhaust').length;
-    const chips = [];
-    if (fundedN) chips.push(c(ansi.green, 'fund×' + fundedN));
-    if (failN) chips.push(c(ansi.red, 'fail×' + failN));
-    if (exhN) chips.push(c(ansi.red, 'empty×' + exhN));
-    if (spends.length) chips.push(c(ansi.dim, 'spend×' + spends.length));
-    if (chips.length) lines.push(chips.join('  '));
-
-    // spend size histogram (useful shape, not identity)
-    if (spends.length >= 3) {
-      const edges = [0.05, 0.25, 0.5, 1.0, 1.5, 2.5, 5, Infinity];
-      const labels = ['≤5¢', '≤25¢', '≤50¢', '≤$1', '≤$1.5', '≤$2.5', '≤$5', '>$5'];
-      const bins = edges.map(() => 0);
-      for (const s of spends) {
-        const a = s.amount || 0;
-        for (let i = 0; i < edges.length; i++) {
-          if (a <= edges[i]) {
-            bins[i]++;
-            break;
-          }
-        }
-      }
-      const maxB = Math.max(...bins, 1);
-      // pack 2 bins per line when narrow, else more compact single lines
-            const histLines = [];
-      for (let i = 0; i < bins.length; i++) {
-        if (!bins[i]) continue;
-        const maxHist = Math.min(28, Math.max(10, Math.floor(W * 0.35)));
-        const bw = Math.max(1, Math.round(maxHist * (bins[i] / maxB)));
-        histLines.push(
-          c(ansi.dim, labels[i].padEnd(5)) +
+          c(ansi.bold, padVisible(shortModel(r.model), 12)) +
+            c(ansi.dim, (Math.round(frac * 100) + '%').padStart(5)) +
             ' ' +
-            c(ansi.yellow, '='.repeat(bw)) +
-            c(ansi.dim, '-'.repeat(maxHist - bw)) +
-            c(ansi.dim, (' ' + bins[i]).padStart(4)),
+            shareBar(frac, barW, c, ansi.red) +
+            c(ansi.dim, ('$' + (r.count ? r.amount / r.count : 0).toFixed(2) + '/req').padStart(13)) +
+            c(ansi.dim, ('×' + r.count).padStart(7)),
         );
       }
-      if (histLines.length) {
-        lines.push(c(ansi.dim, 'ticket $'));
-        for (const hl of histLines.slice(0, 6)) lines.push(hl);
-      }
+      add('');
     }
 
-    // per-model summary (sum, count, avg, last)
-    /** @type {Map<string, number[]>} */
-    const buckets = new Map();
-    for (const ev of spends) {
-      const k = ev.model || '?';
-      if (!buckets.has(k)) buckets.set(k, []);
-      buckets.get(k).push(ev.amount);
-    }
-    const order = [...buckets.entries()].sort((a, b) => {
-      const sa = a[1].reduce((x, y) => x + y, 0);
-      const sb = b[1].reduce((x, y) => x + y, 0);
-      return sb - sa;
-    });
-    for (const [m, amts] of order) {
-      const sum = amts.reduce((a, b) => a + b, 0);
-      const avg = amts.length ? sum / amts.length : 0;
-      const last = amts.slice(-5).map((a) => moneyFine(a).replace('$', ''));
-      lines.push(
-        c(ansi.bold, padVisible(shortModel(m), 10)) +
-          c(ansi.dim, ('−' + moneyFine(sum)).padStart(9)) +
-          c(ansi.dim, ('×' + amts.length).padStart(5)) +
-          c(ansi.dim, ('avg ' + moneyFine(avg)).padStart(12)) +
-          c(ansi.dim, '  last ' + last.join(' ')),
+    // ── 5 KEYS: one stacked strip ──────────────────────────
+    if (comp) {
+      const stripW = Math.max(12, Math.floor(W * 0.5));
+      const strip = stackBar(
+        [
+          { n: comp.fresh, glyph: '█', color: ansi.green },
+          { n: comp.partial, glyph: '▓', color: ansi.yellow },
+          { n: comp.zero, glyph: '░', color: ansi.gray },
+        ],
+        stripW,
+        c,
+      );
+      add(
+        c(ansi.dim, 'keys  ') +
+          strip +
+          c(ansi.dim, '  ') +
+          c(ansi.green, comp.fresh + ' full') +
+          c(ansi.dim, ' · ') +
+          c(ansi.yellow, comp.partial + ' part') +
+          c(ansi.dim, ' · ') +
+          c(ansi.dim, comp.zero + ' empty'),
       );
     }
 
-    // current pointer (ops useful, still no random emails list)
-    if (health.current && (health.current.balance != null || health.current.status)) {
-      const cb =
-        health.current.balance != null ? moneyBook(Number(health.current.balance)) : '?';
-      lines.push(
-        c(ansi.dim, 'cursor ') +
-          c(ansi.dim, String(health.current.status || 'ok')) +
-          c(ansi.dim, ' book ' + cb) +
-          (health.current.file ? c(ansi.dim, '  ' + String(health.current.file).replace('tokenharbor-api-key', 'key')) : ''),
-      );
-    }
-
-    // fill remaining with a single spark of recent spend magnitudes (not labels)
-    const room = budget - lines.length;
-    if (room > 0 && spends.length >= 4) {
-      const vals = spends.slice(-Math.min(spends.length, W * room)).map((s) => s.amount);
-      // render as block sparkline row(s)
-      const blocks = '▁▂▃▄▅▆▇█';
-      const min = Math.min(...vals);
-      const max = Math.max(...vals);
-      const span = max - min || 1;
-      let spark = '';
-      for (const v of vals) {
-        spark += blocks[Math.min(7, Math.floor(((v - min) / span) * 7))];
-      }
-      // wrap spark across rows
-      for (let i = 0; i < spark.length && lines.length < budget; i += W) {
-        const chunk = spark.slice(i, i + W);
-        lines.push(
-          c(ansi.dim, i === 0 ? 'req $' : '    ') +
-            (i === 0 ? ' ' : '') +
-            c(ansi.yellow, i === 0 ? chunk.slice(0, Math.max(0, W - 6)) : chunk),
-        );
-      }
-      lines.push(c(ansi.dim, 'req $ span ' + moneyFine(min) + '…' + moneyFine(max)));
-    }
-
-    if (!lines.length) {
-      add(c(ansi.dim, 'waiting for traffic…'));
+    // ── 6 SUPPLY: one line idle, rows when busy ────────────
+    if (!ld.running) {
+      const lastRun = supply.added != null && supply.added > 0 ? ' · last +' + supply.added : '';
+      add(c(ansi.dim, 'supply  ') + c(ansi.dim, ld.loaded ? 'idle · next ≤60s' + lastRun : 'not loaded'));
     } else {
-      for (const line of lines.slice(0, budget)) add(line);
+      const ws = supply.workers || [];
+      const chips = ws.map((wk) => {
+        const col =
+          wk.stage === 'done' ? ansi.green : wk.stage === 'fail' ? ansi.red : ansi.yellow;
+        const age = ageSec(wk.at);
+        return c(col, 'w' + wk.id + ' ' + stageLabel(wk.stage)) + c(ansi.dim, age != null ? ' ' + fmtAge(age) : '');
+      });
+      add(
+        c(ansi.dim, 'supply  ') +
+          (chips.length ? chips.join(c(ansi.dim, '  ')) : c(ansi.dim, 'starting…')) +
+          c(ansi.dim, supply.added != null ? '   +' + supply.added + '/' + (supply.maxAdds ?? '?') : ''),
+      );
     }
   }
 
-  // if still short of rows, don't leave a giant void feeling — add a status dock
-  while (out.length < rows - 2) {
-    // only pad one analytical line once then blanks via packFrame
-    break;
-  }
-  // status dock just above footer when we have 1 spare conceptual row in content
-  {
-    const asOf = health.ok && health.asOf ? String(health.asOf).slice(11, 19) + 'Z' : '';
-    const src = health.ok ? health.source || '' : '';
-    const dock = [src, asOf, health.ok ? 'ledger #' + (health.ledgerSeq ?? '—') : null]
-      .filter(Boolean)
-      .join(' · ');
-    // put dock into footer area instead of content if tight
-    var dockStr = dock;
-  }
-
+  // ── footer: provenance, nothing else ─────────────────────
   const clock = new Date(now).toLocaleTimeString('en-GB', { hour12: false });
-  const leftFoot = 'q quit' + (dockStr ? c(ansi.dim, '  ·  ' + dockStr) : '');
-  // leftFoot has ansi - compute gap with strip
-  const leftVis = stripAnsi('q quit' + (dockStr ? '  ·  ' + dockStr : ''));
-  const gap = Math.max(2, cols - gutter * 2 - leftVis.length - clock.length);
-  const footer =
-    pad(
-      c(ansi.dim, 'q quit') +
-        (dockStr ? c(ansi.dim, '  ·  ' + dockStr) : '') +
-        ' '.repeat(gap) +
-        c(ansi.dim, clock),
-    );
+  const sessTxt =
+    sessionStartBal != null && Number.isFinite(sessionStartBal) && Math.abs(bal - sessionStartBal) >= 0.005
+      ? 'session ' + (bal - sessionStartBal >= 0 ? '+' : '') + moneyBook(bal - sessionStartBal)
+      : null;
+  const dockBits = ['q quit', sessTxt, health.ok ? 'ledger #' + (health.ledgerSeq ?? '—') : null].filter(Boolean);
+  const dock = dockBits.join('  ·  ');
+  const gap = Math.max(2, cols - gutter * 2 - dock.length - clock.length);
+  const footer = pad(c(ansi.dim, dock) + ' '.repeat(gap) + c(ansi.dim, clock));
 
-  if (!tty) {
-    return [...out, '', footer].join('\n') + '\n';
-  }
+  if (!tty) return [...out, '', footer].join('\n') + '\n';
   return packFrame(out, footer, cols, rows);
 }
-
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -1190,6 +944,9 @@ export async function runWatch(opts = {}) {
   const cfg = loadConfig({});
   const tty = !!(process.stdout.isTTY && !opts.once && process.env.TH_WATCH_ONCE !== '1');
   const rates = createRateTracker();
+  const series = createSeries({ binMs: 6_000, bins: 400 });
+  const followGateway = createLogFollower(gatewayLogPath);
+  const followSupply = createLogFollower(supplyLogPath);
   const startedAt = Date.now();
   let sessionStartBal = null;
 
@@ -1223,6 +980,22 @@ export async function runWatch(opts = {}) {
 
   const stageSince = new Map();
 
+  // Cold start: the logs have no timestamps, but their tail is recent traffic.
+  // Spread it across the recent window so the first frame is informative.
+  let seeded = false;
+  const seedFromLogs = (nowMs) => {
+    if (seeded) return;
+    seeded = true;
+    const gw = parseGatewayLog(readTail(gatewayLogPath()));
+    const spends = (gw.recent || []).filter((e) => e.kind === 'spend');
+    if (!spends.length) return;
+    const spanMs = Math.min(10 * 60_000, spends.length * 4_000);
+    const step = spanMs / spends.length;
+    spends.forEach((ev, i) => {
+      series.observe({ burn: ev.amount || 0, req: 1 }, nowMs - spanMs + i * step);
+    });
+  };
+
   try {
     do {
       const health = await fetchHealth();
@@ -1234,6 +1007,25 @@ export async function runWatch(opts = {}) {
       const supply = parseSupplyLog(readTail(supplyLogPath()));
       const gateway = parseGatewayLog(readTail(gatewayLogPath()));
       const nowMs = Date.now();
+
+      // Attribute newly-appended log lines to this instant (logs carry no clock).
+      const freshGw = parseGatewayLog(followGateway());
+      let burnTick = 0;
+      let reqTick = 0;
+      for (const ev of freshGw.recent) {
+        if (ev.kind === 'spend') {
+          burnTick += ev.amount || 0;
+          reqTick += 1;
+        }
+      }
+      const freshSupply = parseSupplyLog(followSupply());
+      const fillTick = (freshSupply.recent || []).filter((e) => e.kind === 'funded').length * 5;
+      seedFromLogs(nowMs);
+      series.observe(
+        { burn: burnTick, fill: fillTick, req: reqTick, bal: health.ok ? health.totalBalance : null },
+        nowMs,
+      );
+      series.mark(nowMs);
       for (const wk of supply.workers) {
         const key = String(wk.id);
         const prev = stageSince.get(key);
@@ -1244,7 +1036,11 @@ export async function runWatch(opts = {}) {
           wk.at = prev.at;
         }
       }
-      const rateSnap = rates.rates();
+      const sampled = rates.rates();
+      const observed = series.ratesOver(2);
+      const rateSnap = observed
+        ? { burn: observed.burn, fill: observed.fill, net: observed.net, dtMin: 2 }
+        : sampled;
       const { cols, rows } = termSize();
       const frame = renderGlance({
         tty,
@@ -1256,6 +1052,7 @@ export async function runWatch(opts = {}) {
         rateSamples: rates.samples(),
         sessionStartBal,
         gateway,
+        series,
         now: nowMs,
         startedAt,
         cols,
@@ -1275,3 +1072,4 @@ export async function runWatch(opts = {}) {
     restore();
   }
 }
+
