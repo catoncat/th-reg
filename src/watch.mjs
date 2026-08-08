@@ -277,39 +277,53 @@ function parseGatewayLog(text) {
   for (const line of text.split('\n')) {
     if (!line.trim()) continue;
 
-    // soft−0.80 book=4.19 claude-opus-5   OR   −$0.80 bal=$4.19 claude-opus-5
     let m = line.match(
-      /\)\s*->\s*200\b.*?soft−\$?([\d.]+).*?book=\$?[\d.]+\s+([a-zA-Z0-9._:-]+)/,
+      /\)\s*->\s*200\b.*?soft−\$?([\d.]+).*?book=\$?([\d.]+)\s+([a-zA-Z0-9._:-]+)/,
     );
-    if (!m) {
-      m = line.match(
-        /\)\s*->\s*200\b.*?−\$([\d.]+)\s+bal=\$[\d.]+\s+([a-zA-Z0-9._:-]+)/,
-      );
-    }
     if (m) {
       const amount = Number(m[1]);
-      const model = m[2];
+      const book = Number(m[2]);
+      const model = m[3];
       if (Number.isFinite(amount) && amount > 0) {
         totalSpend += amount;
         if (!byModel[model]) byModel[model] = { amount: 0, count: 0 };
         byModel[model].amount += amount;
         byModel[model].count += 1;
-        recent.push({ kind: 'spend', model, amount });
+        recent.push({ kind: 'spend', model, amount, book });
       }
       continue;
     }
 
-    if (/\)\s*->\s*(?:402|403)\b.*\bbalance\b/i.test(line) || /\(balance\)/.test(line) && /->\s*40[23]/.test(line)) {
-      const mm = line.match(/\s([a-zA-Z0-9._:-]+)\s*$/);
-      recent.push({ kind: 'exhaust', model: mm ? mm[1] : null });
+    m = line.match(/\)\s*->\s*(?:402|403)\b/);
+    if (m) {
+      recent.push({ kind: 'exhaust' });
+      continue;
+    }
+    m = line.match(/\)\s*->\s*401\b/);
+    if (m) {
+      recent.push({ kind: 'dead' });
+      continue;
+    }
+    m = line.match(/\)\s*->\s*429\b/);
+    if (m) {
+      recent.push({ kind: 'ratelimit' });
+      continue;
+    }
+    m = line.match(/adopted (\d+) new key/);
+    if (m) {
+      recent.push({ kind: 'adopt', n: Number(m[1]) });
       continue;
     }
     if (/pool exhausted/i.test(line)) {
-      recent.push({ kind: 'empty', text: 'pool exhausted' });
+      recent.push({ kind: 'pool-empty' });
+      continue;
+    }
+    if (/network error/i.test(line)) {
+      recent.push({ kind: 'neterr' });
     }
   }
 
-  if (recent.length > 120) recent.splice(0, recent.length - 120);
+  if (recent.length > 400) recent.splice(0, recent.length - 400);
   return { recent, byModel, totalSpend };
 }
 
@@ -553,11 +567,6 @@ function poolComposition(health) {
 //   flow      ▐    opposed rate meters (burn vs fill)
 //   time      ⠿    braille dual-line chart over a real axis
 
-/** Share bar: solid vs light, for "part of a whole". */
-function shareBar(frac, width, c, color) {
-  const n = Math.max(0, Math.min(width, Math.round(frac * width)));
-  return c(color, '█'.repeat(n)) + c(ansi.gray, '░'.repeat(width - n));
-}
 
 /** Progress bar: pool level. Distinct glyphs from share. */
 function progressBar(frac, width, c, color) {
@@ -565,19 +574,6 @@ function progressBar(frac, width, c, color) {
   return c(color, '▰'.repeat(n)) + c(ansi.gray, '▱'.repeat(width - n));
 }
 
-/** Stacked composition bar: full / partial / empty in one strip. */
-function stackBar(parts, width, c) {
-  const total = parts.reduce((s, p) => s + p.n, 0) || 1;
-  let used = 0;
-  let out = '';
-  parts.forEach((p, i) => {
-    let n = i === parts.length - 1 ? width - used : Math.round((p.n / total) * width);
-    n = Math.max(0, Math.min(width - used, n));
-    used += n;
-    out += c(p.color, p.glyph.repeat(n));
-  });
-  return out;
-}
 
 /**
  * Braille dual-line chart with real time axis.
@@ -596,133 +592,6 @@ function stackBar(parts, width, c) {
  *  - Splitting into two 1-row lanes produced scatter, not lines; burn gets
  *    the full height and fill is drawn as event ticks along the baseline.
  */
-function burnChart(series, width, height, c) {
-  const w = Math.max(12, width);
-  const h = Math.max(2, height);
-  const cells = w * 2;
-
-  // Only chart the span we have data for; never paint an empty past.
-  const all = series.all();
-  const withData = all.filter((b) => b.burn > 0 || b.fill > 0 || b.req > 0);
-  if (!withData.length) {
-    return [c(ansi.dim, 'no traffic observed yet')];
-  }
-  const oldest = withData[0].t;
-  const nowBin = Math.floor(Date.now() / series.binMs) * series.binMs;
-  const haveBins = Math.max(1, Math.round((nowBin - oldest) / series.binMs) + 1);
-  const useBins = Math.min(cells, haveBins);
-
-  const win = series.window(useBins);
-  const perMin = 60_000 / series.binMs;
-
-  // Resample onto the pixel grid so the drawing always spans the full width.
-  const burnRaw = new Array(cells).fill(0);
-  const fill = new Array(cells).fill(0);
-  for (let i = 0; i < cells; i++) {
-    const src = Math.min(win.length - 1, Math.floor((i / cells) * win.length));
-    burnRaw[i] = win[src].burn * perMin;
-    fill[i] = win[src].fill * perMin;
-  }
-
-  // Carry the last known value across empty bins: a gap means "no request
-  // landed in this 6s slot", not "spend dropped to zero".
-  let carry = 0;
-  for (let i = 0; i < cells; i++) {
-    if (burnRaw[i] > 0) carry = burnRaw[i];
-    else burnRaw[i] = carry;
-  }
-
-  // Requests land on bin boundaries unevenly, so a steady spend renders as a
-  // sawtooth. Smooth the burn line; the shape is the signal, not the binning.
-  const smoothW = Math.max(2, Math.round(cells / 40));
-  const burn = burnRaw.map((_, i) => {
-    const lo = Math.max(0, i - smoothW);
-    const hi = Math.min(burnRaw.length - 1, i + smoothW);
-    let sum = 0;
-    for (let k = lo; k <= hi; k++) sum += burnRaw[k];
-    return sum / (hi - lo + 1);
-  });
-
-  // Scale to the observed band, not 0..peak: a line hovering at $18 with a
-  // lone $29 spike would otherwise sit in the middle with dead space above
-  // and below. Keep zero visible only when the data actually approaches it.
-  const vmax = Math.max(...burn, 0.0001);
-  const vmin = Math.min(...burn);
-  const nearZero = vmin < vmax * 0.25;
-  const lo = nearZero ? 0 : vmin - (vmax - vmin) * 0.15;
-  const hi = vmax + (vmax - lo) * 0.05;
-  const range = Math.max(hi - lo, 0.0001);
-  const dotRows = h * 4;
-  const grid = Array.from({ length: h }, () => new Array(w).fill(0));
-
-  for (let i = 0; i < cells; i++) {
-    const v = burn[i];
-    if (v <= 0) continue;
-    const level = Math.min(
-      dotRows - 1,
-      Math.max(0, Math.round(((v - lo) / range) * (dotRows - 1))),
-    );
-    const col = Math.floor(i / 2);
-    const half = i % 2;
-    const row = h - 1 - Math.floor(level / 4);
-    const dotIdx = level % 4;
-    const bits = half === 0 ? [0x40, 0x04, 0x02, 0x01] : [0x80, 0x20, 0x10, 0x08];
-    grid[row][col] |= bits[3 - dotIdx];
-  }
-
-  const lines = [];
-  for (let r = 0; r < h; r++) {
-    let body = '';
-    for (let x = 0; x < w; x++) {
-      const mask = grid[r][x];
-      body += mask ? String.fromCharCode(0x2800 + mask) : ' ';
-    }
-    let line = c(ansi.red, body);
-    if (r === 0) line += c(ansi.dim, '  ' + moneyFine(hi) + '/m');
-    else if (r === h - 1) line += c(ansi.dim, '  ' + moneyFine(Math.max(0, lo)) + '/m');
-    lines.push(line);
-  }
-
-  // Fill events as ticks on the baseline: lumpy grants, not a continuous rate.
-  let ticks = '';
-  let anyFill = false;
-  for (let x = 0; x < w; x++) {
-    const a = fill[x * 2] || 0;
-    const b = fill[x * 2 + 1] || 0;
-    if (a > 0 || b > 0) {
-      ticks += '▲';
-      anyFill = true;
-    } else ticks += ' ';
-  }
-  if (anyFill) lines.push(c(ansi.green, ticks) + c(ansi.dim, '  +$5 grants'));
-
-  // Axis reflects the real span of the data on screen.
-  const spanMin = (useBins * series.binMs) / 60_000;
-  const ticksN = Math.max(2, Math.min(5, Math.floor(w / 14)));
-  let axis = '';
-  let cursor = 0;
-  for (let i = 0; i < ticksN; i++) {
-    const frac = i / (ticksN - 1);
-    const pos = Math.round(frac * (w - 1));
-    const mins = spanMin * (1 - frac);
-    const label =
-      i === ticksN - 1
-        ? 'now'
-        : '-' + (mins >= 1 ? Math.round(mins) + 'm' : Math.round(mins * 60) + 's');
-    const target = Math.min(pos, w - label.length);
-    if (target > cursor) {
-      axis += ' '.repeat(target - cursor);
-      cursor = target;
-    }
-    if (cursor <= w - label.length) {
-      axis += label;
-      cursor += label.length;
-    }
-  }
-  lines.push(c(ansi.dim, axis));
-  return lines;
-}
-
 function classify({ health, ld, supply, rates }) {
   if (!health.ok) return 'DOWN';
   const bal = health.totalBalance;
@@ -817,17 +686,68 @@ function stageLabel(stage) {
   return map[stage] || stage;
 }
 
+/** Rolling event feed: newest at the bottom, like a real log tail. */
+function feedLine(ev, c, W) {
+  const pad2 = (s, n) => padVisible(s, n);
+  switch (ev.kind) {
+    case 'spend': {
+      const amt = ('−$' + ev.amount.toFixed(2)).padStart(8);
+      const left = ev.book != null ? c(ansi.dim, ' → $' + ev.book.toFixed(2) + ' left') : '';
+      return (
+        c(ansi.red, '●') +
+        ' ' +
+        c(ansi.dim, 'spend ') +
+        pad2(c(ansi.bold, shortModel(ev.model)), 14) +
+        c(ansi.red, amt) +
+        left
+      );
+    }
+    case 'funded':
+      return (
+        c(ansi.green, '●') +
+        ' ' +
+        c(ansi.dim, 'funded') +
+        ' ' +
+        pad2(c(ansi.green, 'new account'), 14) +
+        c(ansi.green, '   +$5.00')
+      );
+    case 'exhaust':
+      return c(ansi.yellow, '○') + ' ' + c(ansi.dim, 'empty  key drained, rotating');
+    case 'dead':
+      return c(ansi.red, '✗') + ' ' + c(ansi.dim, 'dead   key rejected (401)');
+    case 'ratelimit':
+      return c(ansi.yellow, '~') + ' ' + c(ansi.dim, 'limit  rate limited, backing off');
+    case 'adopt':
+      return c(ansi.green, '+') + ' ' + c(ansi.dim, 'adopt  ') + c(ansi.green, ev.n + ' new key(s) live');
+    case 'pool-empty':
+      return c(ansi.red, '!') + ' ' + c(ansi.red, 'POOL EMPTY — requests failing');
+    case 'neterr':
+      return c(ansi.dim, '·') + ' ' + c(ansi.dim, 'neterr retrying next key');
+    case 'stage':
+      return (
+        c(ansi.yellow, '◐') +
+        ' ' +
+        c(ansi.dim, 'supply ') +
+        pad2(c(ansi.dim, 'w' + ev.worker + ' ' + ev.stage), 14) +
+        c(ansi.dim, ev.detail || '')
+      );
+    default:
+      return c(ansi.dim, '· ' + (ev.text || ev.kind));
+  }
+}
+
 /**
- * Layout — one subject per band, top to bottom by eye priority:
- *   1 MONEY      the number, its direction, its deadline
- *   2 FLOW       burn vs fill, opposed meters on a shared scale
- *   3 TIME       dual-line chart with a real axis   ← the missing piece
- *   4 MODELS     share of burn + unit price
- *   5 KEYS       stacked composition, one strip
- *   6 SUPPLY     one line idle, worker rows only when busy
+ * Layout, driven by how this panel is actually used:
+ *   it stays open all day, so it must feel alive and answer three things —
+ *   how much money is left, is supply really working, what is burning now.
+ *
+ *   1 MONEY    balance, direction, runway
+ *   2 SUPPLY   is it working, which stage, how many this run
+ *   3 MODELS   share of spend as plain text + percent
+ *   4 LIVE     event feed, newest last, fills all remaining rows
  */
 function renderGlance(ctx) {
-  const { health, ld, supply, rates, netPerMin, now, cols, rows, sessionStartBal, gateway, series } = ctx;
+  const { health, ld, supply, rates, netPerMin, now, cols, rows, sessionStartBal, gateway } = ctx;
   const tty = ctx.tty;
   const c = (code, s) => paint(tty, code, s);
   const rateObj = rates || { net: netPerMin };
@@ -839,7 +759,6 @@ function renderGlance(ctx) {
   const pct = target > 0 ? Math.min(1, bal / target) : 0;
   const net = rateObj?.net ?? netPerMin;
   const burn = rateObj?.burn;
-  const fill = rateObj?.fill;
   const comp = health.ok ? poolComposition(health) : null;
 
   const gutter = 2;
@@ -855,135 +774,110 @@ function renderGlance(ctx) {
         ? ansi.green
         : ansi.yellow;
 
-  // ── 1 MONEY ──────────────────────────────────────────────
-  add('');
   if (!health.ok) {
+    add('');
     add(c(ansi.bold, c(ansi.red, 'GATEWAY DOWN')) + c(ansi.dim, '   ' + (health.error || '')));
     add('');
     add(c(ansi.dim, 'launchctl kickstart gui/$(id -u)/com.tokenharbor.gateway'));
   } else {
-    const big = moneyBook(bal);
+    // ── 1 MONEY ────────────────────────────────────────────
+    add('');
     const dir = net == null ? '' : net >= 0 ? '▲' : '▼';
     const dirColor = net == null ? ansi.dim : net >= 0 ? ansi.green : ansi.red;
-    const rate = net == null ? 'measuring' : moneyFine(Math.abs(net)) + '/min';
+    const rateTxt = burn == null ? 'measuring' : moneyFine(burn) + '/min';
     add(
-      c(ansi.bold, c(accent, big)) +
-        c(ansi.dim, '  of ' + money(target) + '   ') +
-        c(dirColor, dir + ' ' + rate),
+      c(ansi.bold, c(accent, moneyBook(bal))) +
+        c(ansi.dim, '  of ' + money(target)) +
+        '   ' +
+        c(dirColor, dir + ' ' + rateTxt),
     );
-    add(
-      c(ansi.bold, c(accent, head.title)) + c(ansi.dim, '  ' + head.sub),
-    );
+    add(c(ansi.bold, c(accent, head.title)) + c(ansi.dim, '  ' + head.sub));
     add(progressBar(pct, W, c, accent) + c(ansi.dim, ' ' + Math.round(pct * 100) + '%'));
-    add('');
 
-    // ── 2 FLOW: opposed meters on a stable, historical scale ──
-    // Scaling to max(burn, fill) alone pins the larger bar at 100% forever.
-    // Anchor to the recent peak so the bars encode magnitude, not just rank.
-    const hist = series ? series.window(200) : [];
-    const perMinHist = series ? 60_000 / series.binMs : 1;
-    const histPeak = hist.length
-      ? Math.max(...hist.map((b) => Math.max(b.burn, b.fill) * perMinHist))
-      : 0;
-    const scale = Math.max(burn || 0, fill || 0, histPeak, 0.01);
-    const meterW = Math.max(10, Math.floor(W * 0.45));
-    const fmtRate = (v, sign) => (v == null ? '  measuring' : (sign + moneyFine(v) + '/m').padStart(11));
-    add(
-      c(ansi.dim, 'burn ') +
-        c(ansi.red, fmtRate(burn, '−')) +
-        '  ' +
-        shareBar(burn == null ? 0 : burn / scale, meterW, c, ansi.red),
-    );
-    add(
-      c(ansi.dim, 'fill ') +
-        c(ansi.green, fmtRate(fill, '+')) +
-        '  ' +
-        shareBar(fill == null ? 0 : fill / scale, meterW, c, ansi.green),
-    );
-    add('');
-
-    // ── 3 TIME ─────────────────────────────────────────────
-    if (series) {
-      add(c(ansi.dim, 'burn over time'));
-      const chartH = rows >= 34 ? 6 : rows >= 28 ? 5 : 4;
-      for (const line of burnChart(series, W - 2, chartH, c)) add('  ' + line);
-      add('');
-    }
-
-    // ── 4 MODELS: share of burn + unit price ───────────────
-    const byModel = gateway?.byModel || {};
-    const mrows = Object.entries(byModel)
-      .map(([model, v]) => ({ model, amount: v.amount, count: v.count }))
-      .sort((a, b) => b.amount - a.amount);
-    const mtotal = mrows.reduce((s, r) => s + r.amount, 0);
-    if (mrows.length) {
-      const barW = Math.max(8, Math.floor(W * 0.3));
-      for (const r of mrows.slice(0, 4)) {
-        const frac = mtotal > 0 ? r.amount / mtotal : 0;
-        add(
-          c(ansi.bold, padVisible(shortModel(r.model), 12)) +
-            c(ansi.dim, (Math.round(frac * 100) + '%').padStart(5)) +
-            ' ' +
-            shareBar(frac, barW, c, ansi.red) +
-            c(ansi.dim, ('$' + (r.count ? r.amount / r.count : 0).toFixed(2) + '/req').padStart(13)) +
-            c(ansi.dim, ('×' + r.count).padStart(7)),
-        );
-      }
-      add('');
-    }
-
-    // ── 5 KEYS: one stacked strip ──────────────────────────
     if (comp) {
-      const stripW = Math.max(12, Math.floor(W * 0.5));
-      const strip = stackBar(
-        [
-          { n: comp.fresh, glyph: '█', color: ansi.green },
-          { n: comp.partial, glyph: '▓', color: ansi.yellow },
-          { n: comp.zero, glyph: '░', color: ansi.gray },
-        ],
-        stripW,
-        c,
-      );
       add(
         c(ansi.dim, 'keys  ') +
-          strip +
-          c(ansi.dim, '  ') +
           c(ansi.green, comp.fresh + ' full') +
           c(ansi.dim, ' · ') +
-          c(ansi.yellow, comp.partial + ' part') +
+          c(ansi.yellow, comp.partial + ' partial') +
           c(ansi.dim, ' · ') +
-          c(ansi.dim, comp.zero + ' empty'),
+          c(ansi.dim, comp.zero + ' empty') +
+          c(ansi.dim, '   (' + comp.total + ' total)'),
       );
     }
+    add('');
 
-    // ── 6 SUPPLY: one line idle, rows when busy ────────────
-    if (!ld.running) {
-      const lastRun = supply.added != null && supply.added > 0 ? ' · last +' + supply.added : '';
-      add(c(ansi.dim, 'supply  ') + c(ansi.dim, ld.loaded ? 'idle · next ≤60s' + lastRun : 'not loaded'));
+    // ── 2 SUPPLY ───────────────────────────────────────────
+    if (!ld.loaded) {
+      add(c(ansi.dim, 'supply  ') + c(ansi.red, 'launchd not loaded'));
+    } else if (!ld.running) {
+      const last = supply.added != null && supply.added > 0 ? ' · last run +' + supply.added : '';
+      add(c(ansi.dim, 'supply  ') + c(ansi.dim, 'idle, tops up on demand' + last));
     } else {
       const ws = supply.workers || [];
       const chips = ws.map((wk) => {
         const col =
           wk.stage === 'done' ? ansi.green : wk.stage === 'fail' ? ansi.red : ansi.yellow;
         const age = ageSec(wk.at);
-        return c(col, 'w' + wk.id + ' ' + stageLabel(wk.stage)) + c(ansi.dim, age != null ? ' ' + fmtAge(age) : '');
+        return (
+          c(col, 'w' + wk.id + ' ' + stageLabel(wk.stage)) +
+          c(ansi.dim, age != null ? ' ' + fmtAge(age) : '')
+        );
       });
       add(
         c(ansi.dim, 'supply  ') +
-          (chips.length ? chips.join(c(ansi.dim, '  ')) : c(ansi.dim, 'starting…')) +
-          c(ansi.dim, supply.added != null ? '   +' + supply.added + '/' + (supply.maxAdds ?? '?') : ''),
+          (chips.length ? chips.join(c(ansi.dim, '  ')) : c(ansi.yellow, 'starting…')) +
+          c(ansi.dim, supply.added != null ? '   +' + supply.added + ' this run' : ''),
       );
+    }
+    add('');
+
+    // ── 3 MODELS: plain text + percent ─────────────────────
+    const byModel = gateway?.byModel || {};
+    const mrows = Object.entries(byModel)
+      .map(([model, v]) => ({ model, amount: v.amount, count: v.count }))
+      .sort((a, b) => b.amount - a.amount);
+    const mtotal = mrows.reduce((s, r) => s + r.amount, 0);
+    if (mrows.length) {
+      add(c(ansi.dim, 'spend by model'));
+      for (const r of mrows.slice(0, 5)) {
+        const share = mtotal > 0 ? (r.amount / mtotal) * 100 : 0;
+        add(
+          '  ' +
+            padVisible(c(ansi.bold, shortModel(r.model)), 16) +
+            c(accent, (share >= 10 ? share.toFixed(0) : share.toFixed(1)).padStart(4) + '%') +
+            c(ansi.dim, ('  −' + moneyFine(r.amount)).padStart(12)) +
+            c(ansi.dim, ('  ×' + r.count).padStart(7)) +
+            c(ansi.dim, '  $' + (r.count ? r.amount / r.count : 0).toFixed(2) + '/req'),
+        );
+      }
+      add('');
     }
   }
 
-  // ── footer: provenance, nothing else ─────────────────────
+  // ── 4 LIVE FEED: fills whatever is left ──────────────────
+  const footerReserve = 1;
+  const spare = rows - footerReserve - out.length;
+  if (health.ok && spare >= 3) {
+    add(c(ansi.dim, 'live') + c(ansi.dim, '  newest last'));
+    const budget = Math.max(1, rows - footerReserve - out.length);
+
+    const tail = (ctx.feed || []).slice(-budget);
+    if (!tail.length) {
+      add(c(ansi.dim, 'waiting for traffic…'));
+    } else {
+      for (const ev of tail) add(feedLine(ev, c, W));
+    }
+  }
+
   const clock = new Date(now).toLocaleTimeString('en-GB', { hour12: false });
-  const sessTxt =
-    sessionStartBal != null && Number.isFinite(sessionStartBal) && Math.abs(bal - sessionStartBal) >= 0.005
+  const sess =
+    sessionStartBal != null && Math.abs(bal - sessionStartBal) >= 0.005
       ? 'session ' + (bal - sessionStartBal >= 0 ? '+' : '') + moneyBook(bal - sessionStartBal)
       : null;
-  const dockBits = ['q quit', sessTxt, health.ok ? 'ledger #' + (health.ledgerSeq ?? '—') : null].filter(Boolean);
-  const dock = dockBits.join('  ·  ');
+  const dock = ['q quit', sess, health.ok ? 'ledger #' + (health.ledgerSeq ?? '—') : null]
+    .filter(Boolean)
+    .join('  ·  ');
   const gap = Math.max(2, cols - gutter * 2 - dock.length - clock.length);
   const footer = pad(c(ansi.dim, dock) + ' '.repeat(gap) + c(ansi.dim, clock));
 
@@ -1038,6 +932,13 @@ export async function runWatch(opts = {}) {
 
   // Cold start: the logs have no timestamps, but their tail is recent traffic.
   // Spread it across the recent window so the first frame is informative.
+  /** @type {{ kind: string, [k: string]: any }[]} */
+  const feed = [];
+  const pushFeed = (evs) => {
+    for (const ev of evs) feed.push(ev);
+    if (feed.length > 500) feed.splice(0, feed.length - 500);
+  };
+
   let seeded = false;
   const seedFromLogs = (nowMs) => {
     if (seeded) return;
@@ -1050,6 +951,8 @@ export async function runWatch(opts = {}) {
     spends.forEach((ev, i) => {
       series.observe({ burn: ev.amount || 0, req: 1 }, nowMs - spanMs + i * step);
     });
+    // Prime the feed so the panel opens with recent history, not a blank tail.
+    pushFeed((gw.recent || []).slice(-60));
   };
 
   try {
@@ -1076,6 +979,14 @@ export async function runWatch(opts = {}) {
       }
       const freshSupply = parseSupplyLog(followSupply());
       const fillTick = (freshSupply.recent || []).filter((e) => e.kind === 'funded').length * 5;
+
+      // Merge this tick's events from both logs; within a tick, order is
+      // arbitrary but the tick boundary keeps the feed roughly chronological.
+      pushFeed(freshGw.recent || []);
+      for (const ev of freshSupply.recent || []) {
+        if (ev.kind === 'funded') pushFeed([{ kind: 'funded' }]);
+        else if (ev.kind === 'fail') pushFeed([{ kind: 'supply-fail' }]);
+      }
       seedFromLogs(nowMs);
       series.observe(
         { burn: burnTick, fill: fillTick, req: reqTick, bal: health.ok ? health.totalBalance : null },
@@ -1108,6 +1019,7 @@ export async function runWatch(opts = {}) {
         rateSamples: rates.samples(),
         sessionStartBal,
         gateway,
+        feed,
         series,
         now: nowMs,
         startedAt,
