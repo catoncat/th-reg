@@ -19,6 +19,7 @@ const ansi = {
   altOn: '\x1b[?1049h',
   altOff: '\x1b[?1049l',
   clear: '\x1b[H\x1b[J',
+  eraseLine: '\x1b[K',
 };
 
 function paint(enabled, code, s) {
@@ -62,7 +63,9 @@ function packFrame(contentLines, footerLine, cols, rows) {
   const budget = Math.max(1, rows - 1);
   const body = contentLines.map((l) => clipLine(l, cols)).slice(0, budget);
   while (body.length < budget) body.push('');
-  return [...body, foot].join('\n');
+  // Erase to end of line on every row: without this a shorter line leaves the
+  // tail of the previous frame visible, which reads as ghosting.
+  return [...body, foot].map((l) => l + ansi.eraseLine).join('\n');
 }
 
 function gatewayBase() {
