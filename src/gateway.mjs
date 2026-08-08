@@ -8,10 +8,11 @@
 // same HTTP request, so Pi only ever sees a clean success or a clean
 // pool-exhausted error.
 //
-// Balance is an append-only local ledger:
-//   open (+$5) → consume (−estimate from usage) → exhausted (=$0 on hard fail).
-// Successful 200s debit the key using response usage × local sell rates — no
-// wallet re-login. Stream requests get stream_options.include_usage injected.
+// Fact ledger (not a full wallet mirror):
+//   open (+$5) → used (once on first 200) → exhausted ($0 on hard fail).
+// Coarse money is $5 or $0 per key. Optional soft debit (usage × local rates)
+// only interpolates between those facts — never "login every account".
+// Stream requests get stream_options.include_usage so soft fill has a signal.
 //
 // Endpoints:
 //   POST /v1/chat/completions   (stream + non-stream passthrough)
@@ -89,28 +90,31 @@ function extractUsage(raw, streaming) {
   return usage;
 }
 
-function debit(pool, rec, { model, raw, streaming, log }) {
+function onSuccess(pool, rec, { model, raw, streaming, log }) {
+  // Fact first (used once). Soft fill between $5 and $0 is optional interpolation.
   try {
+    if (typeof pool.markUsed === 'function') pool.markUsed(rec, { source: 'gateway' });
+    else pool.report(rec.key, { ok: true });
+
     const usage = extractUsage(raw, streaming);
     const cost = estimateCostUsd(model || 'default', usage);
     if (cost > 0 && typeof pool.consume === 'function') {
-      const r = pool.consume(rec.key, cost, { model, usage, source: 'gateway' });
+      const r = pool.consume(rec.key, cost, { model, usage, source: 'gateway-soft' });
       if (r) {
         log(
-          `${rec.file} (${rec.email || '?'}) -> 200  −$${cost.toFixed(4)}  bal=$${Number(r.balance).toFixed(2)}  ${model || '?'}`,
+          `${rec.file} (${rec.email || '?'}) -> 200  used  soft−${cost.toFixed(4)}  book=${Number(r.balance).toFixed(2)}  ${model || '?'}`,
         );
         return;
       }
     }
-    pool.report(rec.key, { ok: true });
-    log(`${rec.file} (${rec.email || '?'}) -> 200`);
+    log(`${rec.file} (${rec.email || '?'}) -> 200  used`);
   } catch (e) {
     try {
       pool.report(rec.key, { ok: true });
     } catch {
       /* ignore */
     }
-    log(`${rec.file} debit-failed ${String(e).slice(0, 60)}`);
+    log(`${rec.file} onSuccess-failed ${String(e).slice(0, 60)}`);
   }
 }
 
@@ -170,7 +174,7 @@ export function createGateway({ pool, log = () => {}, onPoolExhausted = null }) 
         }
         res.end();
         const raw = Buffer.concat(chunks).toString('utf8');
-        debit(pool, rec, {
+        onSuccess(pool, rec, {
           model: prepared.model,
           raw,
           streaming: prepared.streaming,

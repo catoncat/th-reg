@@ -9,7 +9,9 @@
 //   set_balance absolute balance observation (warm / reconcile / wallet read)
 //   exhausted   upstream proved the wallet empty (402 / balance_zero)
 //   dead        upstream proved the key unusable (401)
-//   consume     spend delta (optional; used when tx cursor lands later)
+//   used        key served ≥1 successful request (fact only; no money change)
+//   consume     soft debit between $5 and $0 (local estimate; optional fill)
+
 //
 // Readers (CLI, supply, /health) fold this file or trust the gateway's
 // in-memory fold — they do NOT re-login every account.
@@ -143,6 +145,10 @@ export function createLedger(filePath) {
           rec.status = 'dead';
           rec.balance = 0;
           rec.balanceKnown = true;
+          break;
+        case 'used':
+          // Fact only: this key has been observed serving traffic.
+          rec.used = true;
           break;
         case 'consume': {
           const amt = Math.abs(Number(ev.amount) || 0);

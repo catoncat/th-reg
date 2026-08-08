@@ -5,10 +5,15 @@
 // moment the gateway reports a hard failure (401/402/403). State persists to
 // data/pool-state.json so restarts don't resurrect dead keys.
 //
-// Balance accounting is append-only via an optional Ledger (see ledger.mjs):
-//   open / set_balance / exhausted / dead / consume
-// Gateway traffic is the primary signal for exhausted/dead (= $0). Readers
-// should prefer healthSnapshot() over re-logging into every account.
+// Fact ledger (append-only; see ledger.mjs) — NOT a full-fleet wallet mirror:
+//   open       → book $5 (welcome grant)
+//   used       → served ≥1 request (once; identity fact, no money change)
+//   exhausted  → upstream empty → book $0
+//   dead       → unusable key → book $0
+//   consume    → optional soft fill between $5 and $0 (local estimate only)
+// Coarse money is $5 or $0 per key (≤$5 uncertainty accepted). Never login the
+// whole fleet; if a live balance is needed, only used && still-active keys,
+// and only once per fact. Readers prefer healthSnapshot().
 //
 // Status lifecycle:
 //   registering -> ok -> exhausted | dead | quota
@@ -131,8 +136,9 @@ export class Pool {
         password: acct.password || p.password || null,
         status: p.status || 'ok', // ok | exhausted | dead | quota | registering
         balance,
+        used: !!p.used || p.status === 'exhausted' || p.status === 'dead',
         lastError: p.lastError || null,
-        lastUsed: null,
+        lastUsed: p.lastUsed || null,
         failCount: p.failCount || 0,
       });
     }
@@ -146,7 +152,9 @@ export class Pool {
         status: rec.status,
         email: rec.email,
         balance: rec.balance,
+        used: !!rec.used,
         lastError: rec.lastError,
+        lastUsed: rec.lastUsed || null,
         failCount: rec.failCount,
         updated_at: updated,
       };
@@ -189,6 +197,7 @@ export class Pool {
         password: acct.password || null,
         status: 'ok', // supply only persists keys for funded accounts
         balance,
+        used: false,
         lastError: null,
         lastUsed: null,
         failCount: 0,
@@ -238,6 +247,7 @@ export class Pool {
     let totalBalance = 0;
     let knownBalanceKeys = 0;
     let unknownBalanceKeys = 0;
+    let usedKeys = 0;
     let activeKeys = 0;
     let exhaustedKeys = 0;
     let deadKeys = 0;
@@ -257,6 +267,7 @@ export class Pool {
     let current = null;
     for (const r of this.all()) {
       const retired = r.status === 'exhausted' || r.status === 'dead';
+      if (r.used || retired) usedKeys++;
       if (r.status === 'dead') deadKeys++;
       else if (r.status === 'exhausted') exhaustedKeys++;
       else if (r.status === 'quota') {
@@ -266,6 +277,7 @@ export class Pool {
         activeKeys++;
       }
 
+      // Money facts: retired → $0; else book (open $5 / soft fill). Unknown → $5.
       let balance = null;
       let balanceKnown = false;
       if (retired) {
@@ -278,7 +290,10 @@ export class Pool {
         knownBalanceKeys++;
         totalBalance += balance;
       } else {
-        unknownBalanceKeys++;
+        balance = 5;
+        balanceKnown = true;
+        knownBalanceKeys++;
+        totalBalance += 5;
       }
 
       const isCurrent = currentKey && r.key === currentKey;
@@ -287,6 +302,7 @@ export class Pool {
         status: r.status,
         balance,
         balanceKnown,
+        used: !!(r.used || retired),
         email: r.email,
         lastError: r.lastError,
         lastUsed: r.lastUsed,
@@ -308,6 +324,7 @@ export class Pool {
       totalBalance: Math.round(totalBalance * 100) / 100,
       knownBalanceKeys,
       unknownBalanceKeys,
+      usedKeys,
       ledgerSeq: this.ledger?.seq ?? null,
       current: current
         ? { email: current.email, file: current.file, balance: current.balance, status: current.status }
@@ -348,6 +365,10 @@ export class Pool {
       rec.status = 'ok';
       rec.lastError = null;
       rec.failCount = 0;
+      rec.lastUsed = at;
+      // Fact: this key has served traffic. Emit once — never re-query the fleet
+      // because of a 200. Money stays $5 until exhaust or soft consume fill.
+      this.markUsed(rec, { at, source: 'gateway' });
       if (outcome.balance != null) {
         rec.balance = outcome.balance;
         this._emit({
@@ -421,9 +442,28 @@ export class Pool {
 
   /** Add a freshly registered account and make it immediately borrowable. */
   
+  
   /**
-   * Append-only spend: subtract from in-memory balance + ledger consume.
-   * No network. Used by gateway on every successful upstream response.
+   * Record the fact that a key served traffic. Once per key.
+   * No network, no money change. Call-set for any future one-shot reconcile.
+   */
+  markUsed(recOrKey, { at = nowIso(), source = 'gateway' } = {}) {
+    const rec = typeof recOrKey === 'string' ? this.keys.get(recOrKey) : recOrKey;
+    if (!rec || rec.used) return false;
+    rec.used = true;
+    this._emit({
+      type: 'used',
+      keyFile: rec.file,
+      email: rec.email,
+      at,
+      source,
+    });
+    return true;
+  }
+
+  /**
+   * Soft fill between open $5 and exhaust $0 (local estimate, no network).
+   * Primary money facts remain open=+$5 and exhausted=$0; this only interpolates.
    */
   consume(key, amount, { model = null, usage = null, source = 'gateway' } = {}) {
     const rec = this.keys.get(key);
@@ -431,9 +471,7 @@ export class Pool {
     const amt = Math.abs(Number(amount) || 0);
     if (!(amt > 0)) return null;
     const at = nowIso();
-    // If we never learned a balance, assume opening $5 (welcome grant) so the
-    // first consumes still move the needle instead of staying stuck at book $5
-    // forever after a seed that wrote 5 without subsequent updates.
+    this.markUsed(rec, { at, source });
     if (rec.balance == null || !Number.isFinite(Number(rec.balance))) {
       rec.balance = 5;
     }
@@ -484,6 +522,7 @@ export class Pool {
       password,
       status: 'ok',
       balance,
+      used: false,
       lastError: null,
       lastUsed: null,
       failCount: 0,
