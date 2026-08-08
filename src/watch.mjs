@@ -22,6 +22,10 @@ const ansi = {
   eraseLine: '\x1b[K',
 };
 
+/** Window for the per-model spend table. Series holds 6s x 400 = 40 min,
+ *  so 30 min stays inside the ring buffer. */
+const MODEL_WINDOW_MIN = 30;
+
 function paint(enabled, code, s) {
   if (!enabled || !code) return s;
   return code + s + ansi.reset;
@@ -339,29 +343,52 @@ function gatewayLogPath() {
  * newly-appended lines to the moment we observe them. Bin = fixed seconds.
  */
 function createSeries({ binMs = 10_000, bins = 60 } = {}) {
-  /** @type {{ t: number, burn: number, fill: number, req: number, bal: number|null }[]} */
+  /** @type {{ t: number, burn: number, fill: number, req: number, bal: number|null, models: Record<string,{amount:number,count:number}> }[]} */
   const buf = [];
   const binOf = (t) => Math.floor(t / binMs) * binMs;
 
+  /** @type {Map<number, object>} */
+  const index = new Map();
+
   const at = (t) => {
     const key = binOf(t);
-    let last = buf[buf.length - 1];
-    if (!last || last.t !== key) {
-      last = { t: key, burn: 0, fill: 0, req: 0, bal: null };
-      buf.push(last);
-      while (buf.length > bins) buf.shift();
+    const existing = index.get(key);
+    if (existing) return existing;
+    const slot = { t: key, burn: 0, fill: 0, req: 0, bal: null, models: Object.create(null) };
+    // Observations can arrive out of order (cold-start backfill interleaves
+    // with live ticks). Keep bins keyed and sorted rather than assuming the
+    // newest write is always the newest bin — appending blindly created
+    // duplicate bins whose values were later dropped by window()'s dedup.
+    index.set(key, slot);
+    if (buf.length && key < buf[buf.length - 1].t) {
+      let i = buf.length;
+      while (i > 0 && buf[i - 1].t > key) i--;
+      buf.splice(i, 0, slot);
+    } else {
+      buf.push(slot);
     }
-    return last;
+    while (buf.length > bins) {
+      const dropped = buf.shift();
+      index.delete(dropped.t);
+    }
+    return slot;
   };
 
   return {
-    /** @param {{ burn?: number, fill?: number, req?: number, bal?: number|null }} d */
+    /** @param {{ burn?: number, fill?: number, req?: number, bal?: number|null, models?: Record<string,{amount:number,count:number}> }} d */
     observe(d, t = Date.now()) {
       const slot = at(t);
       if (d.burn) slot.burn += d.burn;
       if (d.fill) slot.fill += d.fill;
       if (d.req) slot.req += d.req;
       if (d.bal != null) slot.bal = d.bal;
+      if (d.models) {
+        for (const [model, v] of Object.entries(d.models)) {
+          if (!slot.models[model]) slot.models[model] = { amount: 0, count: 0 };
+          slot.models[model].amount += v.amount || 0;
+          slot.models[model].count += v.count || 0;
+        }
+      }
     },
     mark(t = Date.now()) {
       at(t);
@@ -381,6 +408,40 @@ function createSeries({ binMs = 10_000, bins = 60 } = {}) {
       return seen ? { burn, fill, net: fill - burn, req } : null;
     },
 
+    /**
+     * Per-model spend over the last `mins` minutes, so the figure has a
+     * stated time window instead of "whatever fit in the log buffer".
+     * spanMin reports the window actually covered by observations, which is
+     * shorter than `mins` until the panel has been open that long.
+     */
+    /**
+     * Aggregate per-model spend over the last `mins` minutes.
+     * `observedMin` clamps the reported span to how long the caller has
+     * actually been watching, so a young panel says "last 20s" instead of
+     * claiming a full window it has no data for — while the aggregation
+     * itself always scans the full window, which keeps early totals stable
+     * rather than letting bins slide in and out of a shrinking range.
+     */
+    modelsOver(mins = 10, observedMin = Infinity) {
+      const n = Math.max(2, Math.ceil((mins * 60_000) / binMs));
+      const win = this.window(n);
+      /** @type {Record<string,{amount:number,count:number}>} */
+      const agg = Object.create(null);
+      let total = 0;
+      let count = 0;
+      for (const b of win) {
+        for (const [model, v] of Object.entries(b.models || {})) {
+          if (!agg[model]) agg[model] = { amount: 0, count: 0 };
+          agg[model].amount += v.amount;
+          agg[model].count += v.count;
+          total += v.amount;
+          count += v.count;
+        }
+      }
+      const full = (win.length * binMs) / 60_000;
+      return { models: agg, total, count, spanMin: Math.min(full, observedMin) };
+    },
+
     /** Last n bins, oldest first, always length n (zero-filled). */
     window(n) {
       const now = binOf(Date.now());
@@ -388,7 +449,7 @@ function createSeries({ binMs = 10_000, bins = 60 } = {}) {
       const out = [];
       for (let i = n - 1; i >= 0; i--) {
         const t = now - i * binMs;
-        out.push(map.get(t) || { t, burn: 0, fill: 0, req: 0, bal: null });
+        out.push(map.get(t) || { t, burn: 0, fill: 0, req: 0, bal: null, models: {} });
       }
       return out;
     },
@@ -519,6 +580,22 @@ function ageSec(at) {
   return (Date.now() - at) / 1000;
 }
 
+
+/** Share text that stays honest at the small end: 12% / 3.4% / <0.1%. */
+function sharePct(pct) {
+  if (pct <= 0) return '0%';
+  if (pct < 0.1) return '<0.1%';
+  if (pct < 10) return pct.toFixed(1) + '%';
+  return pct.toFixed(0) + '%';
+}
+
+/** Window label: 45s / 8m / 1.5h. */
+function fmtSpan(mins) {
+  if (!(mins > 0)) return '0s';
+  if (mins < 1) return Math.round(mins * 60) + 's';
+  if (mins < 60) return Math.round(mins) + 'm';
+  return (mins / 60).toFixed(1) + 'h';
+}
 
 function padVisible(s, width) {
   const v = stripAnsi(s).length;
@@ -835,20 +912,25 @@ function renderGlance(ctx) {
     }
     add('');
 
-    // ── 3 MODELS: plain text + percent ─────────────────────
-    const byModel = gateway?.byModel || {};
-    const mrows = Object.entries(byModel)
+    // ── 3 MODELS: plain text + percent, over a stated window ───
+    const mw = ctx.modelWindow;
+    const mrows = Object.entries(mw?.models || {})
       .map(([model, v]) => ({ model, amount: v.amount, count: v.count }))
       .sort((a, b) => b.amount - a.amount);
     const mtotal = mrows.reduce((s, r) => s + r.amount, 0);
+    add(
+      c(ansi.dim, 'spend by model') +
+        (mrows.length
+          ? c(ansi.dim, '  last ' + fmtSpan(mw.spanMin) + '   −' + moneyFine(mtotal))
+          : c(ansi.dim, '  watching...')),
+    );
     if (mrows.length) {
-      add(c(ansi.dim, 'spend by model'));
       for (const r of mrows.slice(0, 5)) {
         const share = mtotal > 0 ? (r.amount / mtotal) * 100 : 0;
         add(
           '  ' +
             padVisible(c(ansi.bold, shortModel(r.model)), 16) +
-            c(accent, (share >= 10 ? share.toFixed(0) : share.toFixed(1)).padStart(4) + '%') +
+            c(accent, sharePct(share).padStart(5)) +
             c(ansi.dim, ('  −' + moneyFine(r.amount)).padStart(12)) +
             c(ansi.dim, ('  ×' + r.count).padStart(7)) +
             c(ansi.dim, '  $' + (r.count ? r.amount / r.count : 0).toFixed(2) + '/req'),
@@ -951,6 +1033,11 @@ export async function runWatch(opts = {}) {
     if (!spends.length) return;
     const spanMs = Math.min(10 * 60_000, spends.length * 4_000);
     const step = spanMs / spends.length;
+    // Deliberately no per-model data here: these timestamps are synthetic
+    // (N spends spread over an assumed 4s cadence), so the span they imply is
+    // a guess. Compressing a long log tail into 10 minutes made the model
+    // table read −$318 "last 10m" = $31/min against a measured $12/min.
+    // The table therefore counts only what this process actually observed.
     spends.forEach((ev, i) => {
       series.observe({ burn: ev.amount || 0, req: 1 }, nowMs - spanMs + i * step);
     });
@@ -980,6 +1067,7 @@ export async function runWatch(opts = {}) {
           reqTick += 1;
         }
       }
+      const modelsTick = freshGw.byModel || {};
       const freshSupply = parseSupplyLog(followSupply());
       const fillTick = (freshSupply.recent || []).filter((e) => e.kind === 'funded').length * 5;
 
@@ -992,7 +1080,13 @@ export async function runWatch(opts = {}) {
       }
       seedFromLogs(nowMs);
       series.observe(
-        { burn: burnTick, fill: fillTick, req: reqTick, bal: health.ok ? health.totalBalance : null },
+        {
+          burn: burnTick,
+          fill: fillTick,
+          req: reqTick,
+          models: modelsTick,
+          bal: health.ok ? health.totalBalance : null,
+        },
         nowMs,
       );
       series.mark(nowMs);
@@ -1011,6 +1105,13 @@ export async function runWatch(opts = {}) {
       const rateSnap = observed
         ? { burn: observed.burn, fill: observed.fill, net: observed.net, dtMin: 2 }
         : sampled;
+      // Fixed aggregation window; the label is clamped to real observation
+      // time so it never claims a period this process did not watch.
+      const modelWindow = series.modelsOver(
+        MODEL_WINDOW_MIN,
+        (nowMs - startedAt) / 60_000,
+      );
+
       const { cols, rows } = termSize();
       const frame = renderGlance({
         tty,
@@ -1022,6 +1123,7 @@ export async function runWatch(opts = {}) {
         rateSamples: rates.samples(),
         sessionStartBal,
         gateway,
+        modelWindow,
         feed,
         series,
         now: nowMs,
