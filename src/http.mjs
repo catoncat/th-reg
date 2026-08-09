@@ -46,6 +46,12 @@ export async function httpRequest({ method = 'GET', url, data, contentType, jar,
     } catch (e) {
       lastErr = e;
       try { rmSync(hdrFile, { force: true }); rmSync(bodyFile, { force: true }); } catch { /* ignore */ }
+      // SSL / proxy auth / resolve failures won't heal on the same sticky IP.
+      // Fail fast so registerOne can rotate the session instead of burning ~3s.
+      const msg = String(e?.message || e);
+      if (/SSL certificate|self signed|CONNECT tunnel|Proxy CONNECT|Could not resolve|Connection refused/i.test(msg)) {
+        throw e;
+      }
       await sleep(1000);
       continue;
     }

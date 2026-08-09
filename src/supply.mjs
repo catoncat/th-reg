@@ -289,8 +289,10 @@ export async function supply({ cfg, targetUsd, lowWatermark, maxAdds = 60, worke
         }
       });
 
-      // Per-worker pacing (not global serial). Keeps signup pressure bounded.
-      await sleep(cfg.delayMs);
+      // Adaptive pacing: mail RTT already bounds success rate. Only back off
+      // hard after a real failure (captcha / bad proxy / checkpoint exhausted).
+      const pace = r ? cfg.delayMs : Math.max(cfg.delayMs * 3, 4000);
+      await sleep(pace);
     }
   }
 

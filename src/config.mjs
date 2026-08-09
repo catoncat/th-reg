@@ -55,7 +55,9 @@ export function loadConfig(overrides = {}) {
     dip: { username, password, host, rotatePort: Number(env.DIP_ROTATE_PORT || 823) },
     dipCountry: env.DIP_COUNTRY || 'us',
     count: Number(env.TH_COUNT || 1),
-    delayMs: Number(env.TH_DELAY_MS || 8000),
+    // Inter-account pacing. Success path is already paced by mail RTT;
+    // keep this low. Supply applies a longer backoff only after failures.
+    delayMs: Number(env.TH_DELAY_MS || 1500),
     workers: Number(env.TH_WORKERS || 1),
     inviteCode: env.TH_INVITE_CODE || '',
     // proxy: 'direct' (default, no proxy) | 'sticky' (per-account residential IP) | 'rotate'

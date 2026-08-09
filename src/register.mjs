@@ -56,55 +56,94 @@ import {
 export { SIGNUP_URL, HOST };
 
 export async function registerOne(cfg, { email, password, log = () => {} }) {
-  const sessId = `th${randomHex(6)}`;
-  const proxy = resolveProxy(cfg, sessId);
-  const jar = `/tmp/th-reg-${process.pid}-${sessId}.jar`;
   const mail = createMailProvider(cfg.mailMode, { cli: cfg.mailboxCli });
 
   const result = {
     email,
     password,
-    sess_id: sessId,
-    proxy: proxy ? maskProxy(proxy) : 'direct',
+    sess_id: `th${randomHex(6)}`,
+    proxy: 'direct',
     created_at: new Date().toISOString(),
     status: 'pending',
   };
 
+  // Signup may refresh sticky IP + jar once: Vercel checkpoint bounces POST
+  // as 200+HTML, and bad residential exits show up as curl SSL/network errors.
+  // One cheap session rotate absorbs most noise without burning a new email.
+  let sessId = result.sess_id;
+  let proxy = resolveProxy(cfg, sessId);
+  result.proxy = proxy ? maskProxy(proxy) : 'direct';
+  let jar = `/tmp/th-reg-${process.pid}-${sessId}.jar`;
+  const jarsToClean = new Set([jar]);
+
+  const rotateSession = () => {
+    sessId = `th${randomHex(6)}`;
+    proxy = resolveProxy(cfg, sessId);
+    result.sess_id = sessId;
+    result.proxy = proxy ? maskProxy(proxy) : 'direct';
+    jar = `/tmp/th-reg-${process.pid}-${sessId}.jar`;
+    jarsToClean.add(jar);
+  };
+
   try {
-    // 1. signup page (jar must be shared with the POST below)
-    const page = await fetchActionPage({ jar, proxy });
-    if (!page.key || page.status !== 200) {
-      result.status = 'failed';
-      result.error = `signup page fetch failed (http ${page.status})`;
-      log(`[!] ${result.error}`);
-      return result;
-    }
-    const fp = randomUUID();
-    result.device_fingerprint = fp;
+    const MAX_SIGNUP_ATTEMPTS = 2; // initial + one fresh-session retry
+    let created = false;
+    let lastSignupErr = null;
 
-    // 2. precheck — never bypass Turnstile
-    const pre = await signupPrecheck(fp, { proxy });
-    if (pre.needCaptcha) {
-      result.status = 'captcha-required';
-      result.note = 'signup-precheck requested Turnstile; not bypassed';
-      log(`[!] ${result.note}`);
-      return result;
+    for (let attempt = 1; attempt <= MAX_SIGNUP_ATTEMPTS; attempt++) {
+      try {
+        // 1. signup page (jar must be shared with the POST below)
+        const page = await fetchActionPage({ jar, proxy });
+        if (!page.key || page.status !== 200) {
+          lastSignupErr = `signup page fetch failed (http ${page.status})`;
+          log(`[!] ${lastSignupErr}`);
+        } else {
+          const fp = randomUUID();
+          result.device_fingerprint = fp;
+
+          // 2. precheck — never bypass Turnstile
+          const pre = await signupPrecheck(fp, { proxy });
+          if (pre.needCaptcha) {
+            result.status = 'captcha-required';
+            result.note = 'signup-precheck requested Turnstile; not bypassed';
+            log(`[!] ${result.note}`);
+            return result;
+          }
+
+          // 3. submit the server action
+          const r = await postSignup({
+            email, password, invite: cfg.inviteCode, fp, timezone: cfg.timezone,
+            actionKey: page.key, actionMeta: page.meta, actionArgs: page.args,
+            jar, proxy,
+          });
+          if (r.code === 303) {
+            result.status = 'created';
+            if (attempt > 1) result.signup_retries = attempt - 1;
+            log(`[+] account created (303 -> ${r.location})${attempt > 1 ? ` after ${attempt - 1} session retry` : ''}`);
+            created = true;
+            break;
+          }
+          // Classic checkpoint / soft reject: 200 + signup HTML, no session.
+          lastSignupErr = `signup http ${r.code} ${r.body.slice(0, 160)}`;
+          log(`[!] signup http ${r.code}`);
+        }
+      } catch (err) {
+        // Proxy SSL / tunnel / timeout during signup — retryable via new sticky IP.
+        lastSignupErr = err?.message?.split('\n')[0]?.slice(0, 160) || String(err);
+        log(`[!] signup transport: ${lastSignupErr}`);
+      }
+
+      if (created || attempt >= MAX_SIGNUP_ATTEMPTS) break;
+      log(`[·] rotating sticky session (attempt ${attempt + 1}/${MAX_SIGNUP_ATTEMPTS})`);
+      rotateSession();
+      await sleep(400);
     }
 
-    // 3. submit the server action
-    const r = await postSignup({
-      email, password, invite: cfg.inviteCode, fp, timezone: cfg.timezone,
-      actionKey: page.key, actionMeta: page.meta, actionArgs: page.args,
-      jar, proxy,
-    });
-    if (r.code !== 303) {
+    if (!created) {
       result.status = 'failed';
-      result.error = `signup http ${r.code} ${r.body.slice(0, 160)}`;
-      log(`[!] signup http ${r.code}`);
+      result.error = lastSignupErr || 'signup failed';
       return result;
     }
-    result.status = 'created';
-    log(`[+] account created (303 -> ${r.location})`);
 
     // 4. verify the email for real. This is mandatory: without opening the
     //    mailbox link the API answers 403 email_not_verified, so an account
@@ -161,7 +200,7 @@ export async function registerOne(cfg, { email, password, log = () => {} }) {
 
     return result;
   } finally {
-    rmSync(jar, { force: true });
+    for (const j of jarsToClean) rmSync(j, { force: true });
   }
 }
 
