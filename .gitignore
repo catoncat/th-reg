@@ -8,3 +8,7 @@ node_modules/
 AGENTS.md
 scripts/
 mailbox-http-cli/node_modules/
+# agent tool artifacts (not source)
+.pi-rlm/
+.pi-subagents/
+pi-session-*.html
