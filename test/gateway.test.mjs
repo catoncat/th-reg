@@ -151,3 +151,29 @@ test('gateway relays SSE bytes and protocol usage without translation', async ()
     await close(upstream);
   }
 });
+
+test('gateway falls back to local token estimate when count_tokens upstream stalls', async () => {
+  const upstream = createServer(async (_req, _res) => {
+    // Simulate the observed upstream stall: never respond.
+    await new Promise(() => {});
+  });
+  const upstreamOrigin = await listen(upstream);
+  const gateway = createGateway({ pool: pool(), upstreamBase: `${upstreamOrigin}/v1` });
+  const gatewayOrigin = await listen(gateway);
+  try {
+    const started = Date.now();
+    const response = await fetch(`${gatewayOrigin}/v1/messages/count_tokens`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'th-local', 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hello world' }] }),
+    });
+    const elapsed = Date.now() - started;
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.ok(body.input_tokens >= 1);
+    assert.ok(elapsed < 5000, `fallback should be fast, took ${elapsed}ms`);
+  } finally {
+    await close(gateway);
+    await close(upstream);
+  }
+});

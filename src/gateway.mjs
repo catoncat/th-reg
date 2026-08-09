@@ -178,7 +178,7 @@ export function createGateway({
   timeoutMs = TIMEOUT,
   maxKeyAttempts = MAX_KEY_ATTEMPTS,
 }) {
-  async function handleMessages(req, res, bodyBuf) {
+  async function handleMessages(req, res, bodyBuf, endpoint = 'messages') {
     const tried = new Set();
     let lastHard = null;
     let model = null;
@@ -190,6 +190,37 @@ export function createGateway({
     } catch {
       /* upstream will report malformed JSON */
     }
+    // count_tokens is a metering endpoint: it does not spend, so we do not
+    // mark the key used or rotate on failure — just forward the first result.
+    const metering = endpoint === 'messages/count_tokens';
+    // Local token estimate for the metering endpoint. Claude Code calls
+    // count_tokens before every request to budget context; if the upstream
+    // metering endpoint hangs (observed: upstream Anthropic POST path can
+    // stall while GET stays healthy), we fall back to an approximation so the
+    // agent keeps moving instead of blocking for the full upstream timeout.
+    // This is a budget estimate, not billing — the real call reports usage.
+    const estimateTokens = (buf) => {
+      try {
+        const j = JSON.parse(buf.toString('utf8'));
+        const parts = [j.system, ...(j.messages || [])].map((m) => {
+          if (m == null) return '';
+          if (typeof m === 'string') return m;
+          const c = m?.content;
+          return typeof c === 'string' ? c : JSON.stringify(c ?? '');
+        });
+        const text = parts.join(' ');
+        let ascii = 0;
+        let cjk = 0;
+        for (const ch of text) {
+          if (ch.codePointAt(0) > 0x2e80) cjk += 1;
+          else ascii += 1;
+        }
+        // ASCII ≈ 4 chars/token, CJK ≈ 1 char/token. Approximation only.
+        return Math.max(1, Math.ceil(ascii / 4) + cjk);
+      } catch {
+        return 0;
+      }
+    };
 
     for (let attempt = 0; attempt < maxKeyAttempts; attempt++) {
       const rec = pool.borrowKey(tried);
@@ -211,13 +242,20 @@ export function createGateway({
 
       let upstream;
       try {
-        upstream = await fetch(`${upstreamBase}/messages`, {
+        // Metering endpoint gets a short budget; fall back to local estimate
+        // when the upstream stalls (see comment at estimateTokens).
+        upstream = await fetch(`${upstreamBase}/${endpoint}`, {
           method: 'POST',
           headers: upstreamHeaders(req, 'anthropic', rec.key),
           body: bodyBuf,
-          signal: AbortSignal.timeout(timeoutMs),
+          signal: AbortSignal.timeout(metering ? 3000 : timeoutMs),
         });
       } catch (e) {
+        if (metering) {
+          const estimated = estimateTokens(bodyBuf);
+          log(`count_tokens upstream unavailable (${String(e).slice(0, 40)}); local estimate ${estimated}`);
+          return sendJson(res, 200, { input_tokens: estimated });
+        }
         pool.report(rec.key, { ok: false, reason: 'network', error: String(e).slice(0, 80) });
         log(`${rec.file} Anthropic network error, trying next key`);
         continue;
@@ -234,12 +272,14 @@ export function createGateway({
           }
         }
         res.end();
-        onSuccess(pool, rec, {
-          model,
-          raw: Buffer.concat(chunks).toString('utf8'),
-          streaming,
-          log,
-        });
+        if (!metering) {
+          onSuccess(pool, rec, {
+            model,
+            raw: Buffer.concat(chunks).toString('utf8'),
+            streaming,
+            log,
+          });
+        }
         return;
       }
 
@@ -468,6 +508,10 @@ export function createGateway({
       if (req.method === 'POST' && url.pathname === '/v1/responses') {
         const body = await readBody(req);
         return await handleOpenAI(req, res, body, 'responses');
+      }
+      if (req.method === 'POST' && url.pathname === '/v1/messages/count_tokens') {
+        const body = await readBody(req);
+        return await handleMessages(req, res, body, 'messages/count_tokens');
       }
       if (req.method === 'POST' && url.pathname === '/v1/messages') {
         const body = await readBody(req);
