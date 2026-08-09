@@ -14,12 +14,16 @@
 // only interpolates between those facts — never "login every account".
 // Stream requests get stream_options.include_usage so soft fill has a signal.
 //
-// Endpoints (request/response bodies are never translated):
+// Endpoints (bodies pass through; only one additive field is injected):
 //   POST /v1/chat/completions   (OpenAI Chat Completions)
 //   POST /v1/responses          (OpenAI Responses)
 //   POST /v1/messages           (Anthropic Messages)
 //   GET  /v1/models             (proxied, for pi model discovery)
 //   GET  /health                (pool status: active keys, total balance)
+//
+// Upstream spend guard (2026-08-09): tokenharbor rejects calls whose pessimistic
+// estimate exceeds half the key balance unless body has th_confirm_spend:true.
+// Pi/clients never send it, so the gateway injects it on every JSON POST.
 //
 // Failure mapping (must mirror th-api.probeKey): tokenharbor returns
 // 403 code=balance_zero for an empty wallet, 401 for a dead key, 429 for quota.
@@ -31,10 +35,11 @@ const UPSTREAM = 'https://tokenharbor.ai/v1';
 const TIMEOUT = 120000; // upstream LLM calls can be slow
 const MAX_KEY_ATTEMPTS = 8; // give up after trying this many distinct keys
 
-function classify(status, code) {
+function classify(status, code, message = '') {
   if (status === 401 || code === 'unauthorized') return 'dead';
-  if (status === 402 || code === 'balance_zero' || /insufficient|balance/i.test(code || '')) return 'balance';
-  if (status === 429 || /rate|limit|quota/i.test(code || '')) return 'quota';
+  const failureText = `${code || ''} ${message || ''}`;
+  if (status === 402 || code === 'balance_zero' || /insufficient|balance|top up/i.test(failureText)) return 'balance';
+  if (status === 429 || /rate|limit|quota/i.test(failureText)) return 'quota';
   if (status >= 500 || status === 0) return 'network';
   return 'unknown';
 }
@@ -43,6 +48,25 @@ async function readBody(req) {
   const chunks = [];
   for await (const c of req) chunks.push(c);
   return Buffer.concat(chunks);
+}
+
+/**
+ * Upstream requires an explicit opt-in when the pessimistic cost estimate is
+ * >50% of the key balance (code spend_confirmation_required). Inject it so
+ * every client behind this gateway keeps working without per-client patches.
+ * Non-JSON bodies pass through unchanged.
+ */
+export function injectConfirmSpend(bodyBuf) {
+  if (!bodyBuf || !bodyBuf.length) return bodyBuf;
+  try {
+    const j = JSON.parse(bodyBuf.toString('utf8'));
+    if (!j || typeof j !== 'object' || Array.isArray(j)) return bodyBuf;
+    if (j.th_confirm_spend === true) return bodyBuf;
+    j.th_confirm_spend = true;
+    return Buffer.from(JSON.stringify(j), 'utf8');
+  } catch {
+    return bodyBuf;
+  }
 }
 
 function sendJson(res, status, obj) {
@@ -179,6 +203,7 @@ export function createGateway({
   maxKeyAttempts = MAX_KEY_ATTEMPTS,
 }) {
   async function handleMessages(req, res, bodyBuf, endpoint = 'messages') {
+    bodyBuf = injectConfirmSpend(bodyBuf);
     const tried = new Set();
     let lastHard = null;
     let model = null;
@@ -285,13 +310,15 @@ export function createGateway({
 
       const failureBody = Buffer.from(await upstream.arrayBuffer());
       let code = '';
+      let message = '';
       try {
         const failure = JSON.parse(failureBody.toString('utf8'));
         code = failure?.error?.code || failure?.error?.type || '';
+        message = failure?.error?.message || '';
       } catch {
         /* not json */
       }
-      const reason = classify(status, code);
+      const reason = classify(status, code, message);
       if (!isRetryable(status, reason)) {
         res.writeHead(status, responseHeaders(upstream));
         res.end(failureBody);
@@ -311,6 +338,7 @@ export function createGateway({
   }
 
   async function handleOpenAI(req, res, bodyBuf, endpoint) {
+    bodyBuf = injectConfirmSpend(bodyBuf);
     // Record routing metadata only. Do not persist prompt contents.
     if (requestLog) {
       try {
@@ -443,13 +471,15 @@ export function createGateway({
       // hard failure: classify, retire the key, retry with another
       const failureBody = Buffer.from(await upstream.arrayBuffer());
       let code = '';
+      let message = '';
       try {
         const failure = JSON.parse(failureBody.toString('utf8'));
         code = failure?.error?.code || failure?.error?.type || '';
+        message = failure?.error?.message || '';
       } catch {
         /* not json */
       }
-      const reason = classify(status, code);
+      const reason = classify(status, code, message);
       if (!isRetryable(status, reason)) {
         res.writeHead(status, responseHeaders(upstream));
         res.end(failureBody);

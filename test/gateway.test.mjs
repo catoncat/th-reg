@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { createGateway } from '../src/gateway.mjs';
+import { createGateway, injectConfirmSpend } from '../src/gateway.mjs';
 
 async function listen(server) {
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -26,6 +26,15 @@ function pool(keys = ['key-one']) {
     },
   };
 }
+
+test('injectConfirmSpend adds th_confirm_spend without clobbering other fields', () => {
+  const out = JSON.parse(injectConfirmSpend(Buffer.from(JSON.stringify({ model: 'x', max_tokens: 8 }))).toString());
+  assert.deepEqual(out, { model: 'x', max_tokens: 8, th_confirm_spend: true });
+  const already = Buffer.from(JSON.stringify({ th_confirm_spend: true, model: 'y' }));
+  assert.equal(injectConfirmSpend(already), already);
+  const bad = Buffer.from('not-json');
+  assert.equal(injectConfirmSpend(bad), bad);
+});
 
 test('gateway transparently relays all three protocol bodies and relevant headers', async () => {
   const seen = [];
@@ -72,7 +81,7 @@ test('gateway transparently relays all three protocol bodies and relevant header
       '/v1/messages',
     ]);
     for (let index = 0; index < cases.length; index++) {
-      assert.deepEqual(JSON.parse(seen[index].body), cases[index][1]);
+      assert.deepEqual(JSON.parse(seen[index].body), { ...cases[index][1], th_confirm_spend: true });
       assert.equal(seen[index].headers['x-client-request-id'], 'client-request');
     }
     assert.equal(seen[0].headers.authorization, 'Bearer key-one');
@@ -120,6 +129,50 @@ test('gateway rotates keys on hard failures but preserves ordinary upstream erro
   } finally {
     await close(gateway);
     await close(upstream);
+  }
+});
+
+test('gateway rotates on balance-zero 403 expressed only in error.message', async () => {
+  for (const path of ['/v1/responses', '/v1/messages']) {
+    const attempts = [];
+    const upstream = createServer(async (req, res) => {
+      const key = req.headers.authorization?.replace('Bearer ', '') || req.headers['x-api-key'];
+      attempts.push(key);
+      res.writeHead(key === 'key-one' ? 403 : 200, { 'content-type': 'application/json' });
+      if (key === 'key-one') {
+        return res.end(
+          JSON.stringify({
+            type: 'error',
+            error: {
+              type: 'permission_error',
+              message: 'Your Token Harbor balance is at $0. Top up at https://tokenharbor.ai/dashboard to keep using paid models.',
+            },
+          }),
+        );
+      }
+      res.end(JSON.stringify({ id: 'ok', usage: { input_tokens: 1, output_tokens: 1 } }));
+    });
+    const upstreamOrigin = await listen(upstream);
+    const keyPool = pool(['key-one', 'key-two']);
+    const gateway = createGateway({ pool: keyPool, upstreamBase: `${upstreamOrigin}/v1` });
+    const gatewayOrigin = await listen(gateway);
+    try {
+      const response = await fetch(`${gatewayOrigin}${path}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(
+          path.endsWith('/messages')
+            ? { model: 'claude-opus-5', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }
+            : { model: 'gpt-5.6-sol', input: 'hi' },
+        ),
+      });
+      assert.equal(response.status, 200, path);
+      assert.deepEqual(attempts, ['key-one', 'key-two'], path);
+      assert.equal(keyPool.reports[0].reason, 'balance', path);
+    } finally {
+      await close(gateway);
+      await close(upstream);
+    }
   }
 });
 
