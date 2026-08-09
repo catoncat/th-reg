@@ -14,8 +14,10 @@
 // only interpolates between those facts — never "login every account".
 // Stream requests get stream_options.include_usage so soft fill has a signal.
 //
-// Endpoints:
-//   POST /v1/chat/completions   (stream + non-stream passthrough)
+// Endpoints (request/response bodies are never translated):
+//   POST /v1/chat/completions   (OpenAI Chat Completions)
+//   POST /v1/responses          (OpenAI Responses)
+//   POST /v1/messages           (Anthropic Messages)
 //   GET  /v1/models             (proxied, for pi model discovery)
 //   GET  /health                (pool status: active keys, total balance)
 //
@@ -49,20 +51,59 @@ function sendJson(res, status, obj) {
   res.end(b);
 }
 
-/** Ensure streaming responses include a final usage chunk we can cost. */
-function prepareUpstreamBody(bodyBuf) {
-  try {
-    const j = JSON.parse(bodyBuf.toString('utf8'));
-    const model = j.model || null;
-    const streaming = !!j.stream;
-    if (streaming) {
-      j.stream_options = { ...(j.stream_options || {}), include_usage: true };
-      return { body: Buffer.from(JSON.stringify(j)), model, streaming };
+const HOP_BY_HOP_HEADERS = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+]);
+
+/** Copy end-to-end request headers while replacing client/local authentication. */
+function upstreamHeaders(req, protocol, key) {
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(req.headers)) {
+    const lower = name.toLowerCase();
+    if (
+      value == null ||
+      HOP_BY_HOP_HEADERS.has(lower) ||
+      lower === 'host' ||
+      lower === 'content-length' ||
+      lower === 'authorization' ||
+      lower === 'x-api-key'
+    ) {
+      continue;
     }
-    return { body: bodyBuf, model, streaming: false };
-  } catch {
-    return { body: bodyBuf, model: null, streaming: false };
+    headers.set(name, Array.isArray(value) ? value.join(', ') : value);
   }
+  if (!headers.has('content-type')) headers.set('content-type', 'application/json');
+  if (protocol === 'anthropic') {
+    headers.set('x-api-key', key);
+    if (!headers.has('anthropic-version')) headers.set('anthropic-version', '2023-06-01');
+  } else {
+    headers.set('authorization', `Bearer ${key}`);
+  }
+  return headers;
+}
+
+/** Preserve upstream status metadata and protocol-specific response headers. */
+function responseHeaders(upstream) {
+  const headers = {};
+  for (const [name, value] of upstream.headers) {
+    const lower = name.toLowerCase();
+    // Node fetch transparently decompresses upstream bodies, so the original
+    // content-encoding/content-length no longer describe the relayed bytes.
+    if (HOP_BY_HOP_HEADERS.has(lower) || lower === 'content-length' || lower === 'content-encoding') continue;
+    headers[name] = value;
+  }
+  return headers;
+}
+
+function isRetryable(status, reason) {
+  return reason === 'dead' || reason === 'balance' || reason === 'quota' || status >= 500;
 }
 
 /** Pull OpenAI-style usage from a buffered non-stream or SSE body. */
@@ -82,7 +123,8 @@ function extractUsage(raw, streaming) {
     if (!data || data === '[DONE]') continue;
     try {
       const j = JSON.parse(data);
-      if (j.usage) usage = j.usage;
+      const eventUsage = j.usage || j.message?.usage || j.response?.usage;
+      if (eventUsage) usage = { ...(usage || {}), ...eventUsage };
     } catch {
       /* partial */
     }
@@ -90,7 +132,7 @@ function extractUsage(raw, streaming) {
   return usage;
 }
 
-function onSuccess(pool, rec, { model, raw, streaming, log }) {
+function onSuccess(pool, rec, { model, raw, streaming, log, requestMeta = null }) {
   // Fact first (used once). Soft fill between $5 and $0 is optional interpolation.
   try {
     if (typeof pool.markUsed === 'function') pool.markUsed(rec, { source: 'gateway' });
@@ -99,10 +141,19 @@ function onSuccess(pool, rec, { model, raw, streaming, log }) {
     const usage = extractUsage(raw, streaming);
     const cost = estimateCostUsd(model || 'default', usage);
     if (cost > 0 && typeof pool.consume === 'function') {
-      const r = pool.consume(rec.key, cost, { model, usage, source: 'gateway-soft' });
+      const r = pool.consume(rec.key, cost, {
+        model,
+        usage,
+        source: 'gateway-soft',
+        project: requestMeta?.project || null,
+        session: requestMeta?.sessionId || null,
+      });
       if (r) {
+        const route = requestMeta?.project
+          ? `  project=${encodeURIComponent(requestMeta.project)}${requestMeta.sessionId ? `  session=${encodeURIComponent(requestMeta.sessionId)}` : ''}`
+          : '';
         log(
-          `${rec.file} (${rec.email || '?'}) -> 200  used  soft−${cost.toFixed(4)}  book=${Number(r.balance).toFixed(2)}  ${model || '?'}`,
+          `${rec.file} (${rec.email || '?'}) -> 200  used  soft−${cost.toFixed(4)}  book=${Number(r.balance).toFixed(2)}  ${model || '?'}${route}`,
         );
         return;
       }
@@ -118,13 +169,181 @@ function onSuccess(pool, rec, { model, raw, streaming, log }) {
   }
 }
 
-export function createGateway({ pool, log = () => {}, onPoolExhausted = null }) {
-  async function handleChat(req, res, bodyBuf) {
+export function createGateway({
+  pool,
+  log = () => {},
+  onPoolExhausted = null,
+  requestLog = null,
+  upstreamBase = UPSTREAM,
+  timeoutMs = TIMEOUT,
+  maxKeyAttempts = MAX_KEY_ATTEMPTS,
+}) {
+  async function handleMessages(req, res, bodyBuf) {
     const tried = new Set();
     let lastHard = null;
-    const prepared = prepareUpstreamBody(bodyBuf);
+    let model = null;
+    let streaming = false;
+    try {
+      const j = JSON.parse(bodyBuf.toString('utf8'));
+      model = j.model || null;
+      streaming = !!j.stream;
+    } catch {
+      /* upstream will report malformed JSON */
+    }
 
-    for (let attempt = 0; attempt < MAX_KEY_ATTEMPTS; attempt++) {
+    for (let attempt = 0; attempt < maxKeyAttempts; attempt++) {
+      const rec = pool.borrowKey(tried);
+      if (!rec) {
+        log(`pool exhausted after ${tried.size} Anthropic key attempt(s)`);
+        try {
+          onPoolExhausted?.({ tried: tried.size });
+        } catch {
+          /* never break the 503 path */
+        }
+        return sendJson(res, 503, {
+          error: {
+            message: 'tokenharbor pool exhausted: no healthy key with balance. Run supply / top-up.',
+            type: 'pool_exhausted',
+          },
+        });
+      }
+      tried.add(rec.key);
+
+      let upstream;
+      try {
+        upstream = await fetch(`${upstreamBase}/messages`, {
+          method: 'POST',
+          headers: upstreamHeaders(req, 'anthropic', rec.key),
+          body: bodyBuf,
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+      } catch (e) {
+        pool.report(rec.key, { ok: false, reason: 'network', error: String(e).slice(0, 80) });
+        log(`${rec.file} Anthropic network error, trying next key`);
+        continue;
+      }
+
+      const status = upstream.status;
+      if (status >= 200 && status < 300) {
+        res.writeHead(status, responseHeaders(upstream));
+        const chunks = [];
+        if (upstream.body) {
+          for await (const chunk of upstream.body) {
+            res.write(chunk);
+            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+          }
+        }
+        res.end();
+        onSuccess(pool, rec, {
+          model,
+          raw: Buffer.concat(chunks).toString('utf8'),
+          streaming,
+          log,
+        });
+        return;
+      }
+
+      const failureBody = Buffer.from(await upstream.arrayBuffer());
+      let code = '';
+      try {
+        const failure = JSON.parse(failureBody.toString('utf8'));
+        code = failure?.error?.code || failure?.error?.type || '';
+      } catch {
+        /* not json */
+      }
+      const reason = classify(status, code);
+      if (!isRetryable(status, reason)) {
+        res.writeHead(status, responseHeaders(upstream));
+        res.end(failureBody);
+        return;
+      }
+      pool.report(rec.key, { ok: false, reason, error: code || `http ${status}` });
+      lastHard = { status, code, reason };
+      log(`${rec.file} Anthropic -> ${status} ${code} (${reason}); rotating`);
+    }
+
+    sendJson(res, 503, {
+      error: {
+        message: `tokenharbor upstream failed after ${maxKeyAttempts} key attempts. Last: ${lastHard?.status} ${lastHard?.code}`,
+        type: lastHard?.reason || 'upstream_error',
+      },
+    });
+  }
+
+  async function handleOpenAI(req, res, bodyBuf, endpoint) {
+    // Record routing metadata only. Do not persist prompt contents.
+    if (requestLog) {
+      try {
+        const j = JSON.parse(bodyBuf.toString('utf8'));
+        const text = Array.isArray(j.messages)
+          ? j.messages.map((m) => (typeof m?.content === 'string' ? m.content : '')).join('\n')
+          : '';
+        const workingDirectory = text.match(/Working directory:\s*(.+)/)?.[1]?.trim() || null;
+        const conversationLog = text.match(/Conversation log:\s*(.+)/)?.[1]?.trim() || null;
+        const sessionId = conversationLog
+          ? conversationLog.split('/').pop()?.replace(/\.jsonl$/, '') || null
+          : null;
+        requestLog(
+          JSON.stringify({
+            at: new Date().toISOString(),
+            model: j.model || null,
+            ua: req.headers['user-agent'] || null,
+            project: workingDirectory,
+            session_id: sessionId,
+            remote_port: req.socket.remotePort || null,
+          }),
+        );
+      } catch {
+        /* body not JSON — ignore */
+      }
+    }
+    const tried = new Set();
+    let lastHard = null;
+    let model = null;
+    let streaming = false;
+    try {
+      const j = JSON.parse(bodyBuf.toString('utf8'));
+      model = j.model || null;
+      streaming = !!j.stream;
+    } catch {
+      /* upstream will report malformed JSON */
+    }
+    let requestMeta = null;
+    try {
+      const j = JSON.parse(bodyBuf.toString('utf8'));
+      const text = Array.isArray(j.messages)
+        ? j.messages.map((m) => (typeof m?.content === 'string' ? m.content : '')).join('\n')
+        : '';
+      const project = text.match(/Working directory:\s*(.+)/)?.[1]?.trim() || null;
+      const conversationLog = text.match(/Conversation log:\s*(.+)/)?.[1]?.trim() || null;
+      const sessionId = conversationLog
+        ? conversationLog.split('/').pop()?.replace(/\.jsonl$/, '') || null
+        : null;
+      requestMeta = { project, sessionId };
+      if (!project && process.env.TH_ATTR_DEBUG) {
+        // Structure only — never content. Answers: did the marker arrive at all,
+        // and in what shape did the client send message content?
+        const raw = bodyBuf.toString('utf8');
+        requestLog?.(
+          JSON.stringify({
+            at: new Date().toISOString(),
+            debug: 'attr-miss',
+            model: j.model || null,
+            roles: Array.isArray(j.messages) ? j.messages.map((m) => m?.role) : null,
+            contentKinds: Array.isArray(j.messages)
+              ? j.messages.map((m) =>
+                  typeof m?.content === 'string' ? 'str' : Array.isArray(m?.content) ? 'arr' : typeof m?.content,
+                )
+              : null,
+            markerInRawBody: raw.includes('Working directory:'),
+          }),
+        );
+      }
+    } catch {
+      /* metadata is best effort */
+    }
+
+    for (let attempt = 0; attempt < maxKeyAttempts; attempt++) {
       const rec = pool.borrowKey(tried);
       if (!rec) {
         log(`pool exhausted after ${tried.size} key attempt(s)`);
@@ -145,11 +364,11 @@ export function createGateway({ pool, log = () => {}, onPoolExhausted = null }) 
 
       let upstream;
       try {
-        upstream = await fetch(`${UPSTREAM}/chat/completions`, {
+        upstream = await fetch(`${upstreamBase}/${endpoint}`, {
           method: 'POST',
-          headers: { 'content-type': 'application/json', authorization: `Bearer ${rec.key}` },
-          body: prepared.body,
-          signal: AbortSignal.timeout(TIMEOUT),
+          headers: upstreamHeaders(req, 'openai', rec.key),
+          body: bodyBuf,
+          signal: AbortSignal.timeout(timeoutMs),
         });
       } catch (e) {
         // network-level failure talking to upstream; do NOT kill the key
@@ -159,12 +378,9 @@ export function createGateway({ pool, log = () => {}, onPoolExhausted = null }) 
       }
 
       const status = upstream.status;
-      if (status === 200) {
+      if (status >= 200 && status < 300) {
         // Stream/buffer to client while retaining a copy for usage → local consume.
-        res.writeHead(200, {
-          'content-type': upstream.headers.get('content-type') || 'application/json',
-          'transfer-encoding': 'chunked',
-        });
+        res.writeHead(status, responseHeaders(upstream));
         const chunks = [];
         if (upstream.body) {
           for await (const chunk of upstream.body) {
@@ -175,22 +391,30 @@ export function createGateway({ pool, log = () => {}, onPoolExhausted = null }) 
         res.end();
         const raw = Buffer.concat(chunks).toString('utf8');
         onSuccess(pool, rec, {
-          model: prepared.model,
+          model,
           raw,
-          streaming: prepared.streaming,
+          streaming,
           log,
+          requestMeta,
         });
         return;
       }
 
       // hard failure: classify, retire the key, retry with another
+      const failureBody = Buffer.from(await upstream.arrayBuffer());
       let code = '';
       try {
-        code = (await upstream.clone().json())?.error?.code || '';
+        const failure = JSON.parse(failureBody.toString('utf8'));
+        code = failure?.error?.code || failure?.error?.type || '';
       } catch {
         /* not json */
       }
       const reason = classify(status, code);
+      if (!isRetryable(status, reason)) {
+        res.writeHead(status, responseHeaders(upstream));
+        res.end(failureBody);
+        return;
+      }
       pool.report(rec.key, { ok: false, reason, error: code || `http ${status}` });
       lastHard = { status, code, reason, file: rec.file };
       log(`${rec.file} -> ${status} ${code} (${reason}); rotating`);
@@ -200,7 +424,7 @@ export function createGateway({ pool, log = () => {}, onPoolExhausted = null }) 
     // ran out of attempts
     sendJson(res, 503, {
       error: {
-        message: `tokenharbor upstream failed after ${MAX_KEY_ATTEMPTS} key attempts. Last: ${lastHard?.status} ${lastHard?.code}`,
+        message: `tokenharbor upstream failed after ${maxKeyAttempts} key attempts. Last: ${lastHard?.status} ${lastHard?.code}`,
         type: lastHard?.reason || 'upstream_error',
         code: lastHard?.code || 'upstream_error',
       },
@@ -230,7 +454,7 @@ export function createGateway({ pool, log = () => {}, onPoolExhausted = null }) 
       if (req.method === 'GET' && url.pathname === '/v1/models') {
         const rec = pool.borrowKey();
         if (!rec) return sendJson(res, 503, { error: { message: 'pool exhausted' } });
-        const u = await fetch(`${UPSTREAM}/models`, {
+        const u = await fetch(`${upstreamBase}/models`, {
           headers: { authorization: `Bearer ${rec.key}` },
           signal: AbortSignal.timeout(20000),
         });
@@ -239,7 +463,15 @@ export function createGateway({ pool, log = () => {}, onPoolExhausted = null }) 
       }
       if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
         const body = await readBody(req);
-        return await handleChat(req, res, body);
+        return await handleOpenAI(req, res, body, 'chat/completions');
+      }
+      if (req.method === 'POST' && url.pathname === '/v1/responses') {
+        const body = await readBody(req);
+        return await handleOpenAI(req, res, body, 'responses');
+      }
+      if (req.method === 'POST' && url.pathname === '/v1/messages') {
+        const body = await readBody(req);
+        return await handleMessages(req, res, body);
       }
       sendJson(res, 404, { error: { message: 'not found' } });
     } catch (e) {

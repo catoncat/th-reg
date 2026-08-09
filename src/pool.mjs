@@ -465,7 +465,7 @@ export class Pool {
    * Soft fill between open $5 and exhaust $0 (local estimate, no network).
    * Primary money facts remain open=+$5 and exhausted=$0; this only interpolates.
    */
-  consume(key, amount, { model = null, usage = null, source = 'gateway' } = {}) {
+  consume(key, amount, { model = null, usage = null, source = 'gateway', project = null, session = null } = {}) {
     const rec = this.keys.get(key);
     if (!rec) return null;
     const amt = Math.abs(Number(amount) || 0);
@@ -505,6 +505,8 @@ export class Pool {
         source,
         model: model || undefined,
         usage: usage || undefined,
+        project: project || undefined,
+        session: session || undefined,
       });
     }
     return { balance: rec.balance, status: rec.status, amount: amt };

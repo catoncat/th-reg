@@ -19,6 +19,7 @@
 
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
+import { appendFileSync, truncateSync } from 'node:fs';
 import { loadConfig, PROJECT_ROOT } from './config.mjs';
 import { Pool } from './pool.mjs';
 import { createGateway } from './gateway.mjs';
@@ -48,6 +49,23 @@ const pool = new Pool({
 pool.setLedger(ledger, { seed: true });
 
 const log = (m) => console.log(`[gateway] ${m}`);
+
+// Short-lived routing metadata only: no prompt contents are persisted.
+// The file is truncated on boot and contains project/session attribution when
+// the client includes the standard pi developer context.
+const requestLogPath = process.env.TH_REQUEST_LOG || join(PROJECT_ROOT, 'data', 'gateway-requests.log');
+try {
+  truncateSync(requestLogPath, 0);
+} catch {
+  /* first run / missing */
+}
+const requestLog = (row) => {
+  try {
+    appendFileSync(requestLogPath, `${row}\n`, { mode: 0o600 });
+  } catch {
+    /* best effort — never break the request path */
+  }
+};
 if (pool._note) log(pool._note);
 
 /** Warm the pool: snapshot balances, mark empty wallets exhausted. Writes ledger. */
@@ -111,6 +129,7 @@ function requestSupplyKick(reason) {
 const server = createGateway({
   pool,
   log,
+  requestLog,
   onPoolExhausted: () => requestSupplyKick('pool_exhausted'),
 });
 
