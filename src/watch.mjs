@@ -261,6 +261,12 @@ function parseSupplyLog(text) {
 /** Tail gateway.log for spend/exhaust facts (mixed RECENT feed). */
 
 /** Short model label for glance rows. */
+function shortProject(name) {
+  if (!name) return '?';
+  const s = String(name).replace(/\/$/, '');
+  return s.split('/').pop() || s;
+}
+
 function shortModel(name) {
   if (!name) return '?';
   let s = String(name);
@@ -296,7 +302,16 @@ function parseGatewayLog(text) {
         if (!byModel[model]) byModel[model] = { amount: 0, count: 0 };
         byModel[model].amount += amount;
         byModel[model].count += 1;
-        recent.push({ kind: 'spend', model, amount, book });
+        const projectMatch = line.match(/\sproject=([^\s]+)/);
+        const sessionMatch = line.match(/\ssession=([^\s]+)/);
+        recent.push({
+          kind: 'spend',
+          model,
+          amount,
+          book,
+          project: projectMatch ? decodeURIComponent(projectMatch[1]) : null,
+          sessionId: sessionMatch ? decodeURIComponent(sessionMatch[1]) : null,
+        });
       }
       continue;
     }
@@ -336,6 +351,53 @@ function parseGatewayLog(text) {
 
 function gatewayLogPath() {
   return process.env.TH_GATEWAY_LOG || join(PROJECT_ROOT, 'data', 'gateway.log');
+}
+
+/**
+ * All-time spend from the ledger, cut two ways: by model and by project.
+ * Cached on file size+mtime — this file grows to megabytes and the panel
+ * repaints every few seconds.
+ */
+let ledgerCache = { sig: '', value: null };
+function historicalStats() {
+  const empty = { models: {}, projects: {}, total: 0, count: 0, since: null };
+  const path = join(PROJECT_ROOT, 'data', 'pool-ledger.jsonl');
+  if (!existsSync(path)) return empty;
+  let sig = '';
+  try {
+    const st = fstatSync(openSync(path, 'r'));
+    sig = st.size + ':' + Number(st.mtimeMs).toFixed(0);
+  } catch { /* fall through to reparse */ }
+  if (sig && ledgerCache.sig === sig && ledgerCache.value) return ledgerCache.value;
+
+  const models = Object.create(null);
+  const projects = Object.create(null);
+  let total = 0;
+  let count = 0;
+  let since = null;
+  try {
+    for (const line of readFileSync(path, 'utf8').split('\n')) {
+      if (!line.trim()) continue;
+      let ev;
+      try { ev = JSON.parse(line); } catch { continue; }
+      if (ev.type !== 'consume' || !ev.model) continue;
+      const amount = Number(ev.amount) || 0;
+      if (amount <= 0) continue;
+      if (!models[ev.model]) models[ev.model] = { amount: 0, count: 0 };
+      models[ev.model].amount += amount;
+      models[ev.model].count += 1;
+      const proj = ev.project ? shortProject(ev.project) : 'unattributed';
+      if (!projects[proj]) projects[proj] = { amount: 0, count: 0 };
+      projects[proj].amount += amount;
+      projects[proj].count += 1;
+      total += amount;
+      count += 1;
+      if (ev.at && (!since || ev.at < since)) since = ev.at;
+    }
+  } catch { return empty; }
+  const value = { models, projects, total, count, since };
+  ledgerCache = { sig, value };
+  return value;
 }
 
 /**
@@ -766,43 +828,49 @@ function stageLabel(stage) {
   return map[stage] || stage;
 }
 
-/** Rolling event feed: newest at the bottom, like a real log tail. */
+/** HH:MM:SS for feed rows — the panel's own clock, not the log's. */
+function clockOf(t) {
+  return new Date(t).toLocaleTimeString('en-GB', { hour12: false });
+}
+
+/** Rolling event feed: newest first. */
 function feedLine(ev, c, W) {
   const pad2 = (s, n) => padVisible(s, n);
   switch (ev.kind) {
     case 'spend': {
+      // No per-row icon: at ~1 line/second a glyph column becomes noise.
+      // Weight carries the signal instead — big spends are the only red ones.
+      const heavy = ev.amount >= 0.25;
       const amt = ('−$' + ev.amount.toFixed(2)).padStart(8);
-      const left = ev.book != null ? c(ansi.dim, ' → $' + ev.book.toFixed(2) + ' left') : '';
+      const project = ev.project ? shortProject(ev.project) : '';
       return (
-        c(ansi.red, '●') +
+        c(ansi.dim, ev.at ? clockOf(ev.at) : '     ') +
         ' ' +
-        c(ansi.dim, 'spend ') +
-        pad2(c(ansi.bold, shortModel(ev.model)), 14) +
-        c(ansi.red, amt) +
-        left
+        pad2(c(ansi.bold, shortModel(ev.model)), 17) +
+        c(heavy ? ansi.red : ansi.dim, amt) +
+        '  ' +
+        (project ? c(ansi.dim, project) : '')
       );
     }
     case 'funded':
       return (
-        c(ansi.green, '●') +
+        c(ansi.dim, ev.at ? clockOf(ev.at) : '     ') +
         ' ' +
-        c(ansi.dim, 'funded') +
-        ' ' +
-        pad2(c(ansi.green, 'new account'), 14) +
-        c(ansi.green, '   +$5.00')
+        padVisible(c(ansi.green, '+ new account'), 17) +
+        c(ansi.green, '  +$5.00'.padStart(8))
       );
     case 'exhaust':
-      return c(ansi.yellow, '○') + ' ' + c(ansi.dim, 'empty  key drained, rotating');
+      return c(ansi.dim, ev.at ? clockOf(ev.at) : '     ') + ' ' + c(ansi.dim, 'key drained, rotating');
     case 'dead':
-      return c(ansi.red, '✗') + ' ' + c(ansi.dim, 'dead   key rejected (401)');
+      return c(ansi.dim, ev.at ? clockOf(ev.at) : '     ') + ' ' + c(ansi.red, 'key rejected (401)');
     case 'ratelimit':
-      return c(ansi.yellow, '~') + ' ' + c(ansi.dim, 'limit  rate limited, backing off');
+      return c(ansi.dim, ev.at ? clockOf(ev.at) : '     ') + ' ' + c(ansi.yellow, 'rate limited, backing off');
     case 'adopt':
-      return c(ansi.green, '+') + ' ' + c(ansi.dim, 'adopt  ') + c(ansi.green, ev.n + ' new key(s) live');
+      return c(ansi.dim, ev.at ? clockOf(ev.at) : '     ') + ' ' + c(ansi.green, '+' + ev.n + ' key(s) live');
     case 'pool-empty':
-      return c(ansi.red, '!') + ' ' + c(ansi.red, 'POOL EMPTY — requests failing');
+      return c(ansi.dim, ev.at ? clockOf(ev.at) : '     ') + ' ' + c(ansi.red, 'POOL EMPTY — requests failing');
     case 'neterr':
-      return c(ansi.dim, '·') + ' ' + c(ansi.dim, 'neterr retrying next key');
+      return c(ansi.dim, ev.at ? clockOf(ev.at) : '     ') + ' ' + c(ansi.dim, 'network retry, next key');
     case 'stage':
       return (
         c(ansi.yellow, '◐') +
@@ -912,28 +980,58 @@ function renderGlance(ctx) {
     }
     add('');
 
-    // ── 3 MODELS: plain text + percent, over a stated window ───
-    const mw = ctx.modelWindow;
-    const mrows = Object.entries(mw?.models || {})
-      .map(([model, v]) => ({ model, amount: v.amount, count: v.count }))
-      .sort((a, b) => b.amount - a.amount);
-    const mtotal = mrows.reduce((s, r) => s + r.amount, 0);
+    // ── 3 SPEND: all-time totals, cut by model and by project ──
+    const hist = historicalStats();
+    const mtotal = hist.total;
+    const sinceLabel = hist.since
+      ? new Date(hist.since).toLocaleDateString('en-CA')
+      : null;
     add(
-      c(ansi.dim, 'spend by model') +
-        (mrows.length
-          ? c(ansi.dim, '  last ' + fmtSpan(mw.spanMin) + '   −' + moneyFine(mtotal))
-          : c(ansi.dim, '  watching...')),
+      c(ansi.bold, 'spent  ') +
+        c(ansi.red, moneyBook(mtotal)) +
+        c(ansi.dim, '  across ' + hist.count.toLocaleString('en-US') + ' requests') +
+        c(ansi.dim, sinceLabel ? '  since ' + sinceLabel : ''),
     );
+    add('');
+
+    const rank = (obj) =>
+      Object.entries(obj || {})
+        .map(([name, v]) => ({ name, amount: v.amount, count: v.count }))
+        .sort((a, b) => b.amount - a.amount);
+    const mrows = rank(hist.models);
+    const prows = rank(hist.projects);
+
+    /** Two stacked tables share one column grid so the eye can scan down. */
+    const statRow = (label, r, labelFn) =>
+      '  ' +
+      padVisible(c(ansi.bold, labelFn(r.name)), 22) +
+      c(ansi.dim, moneyFine(r.amount).padStart(10)) +
+      c(accent, sharePct(mtotal > 0 ? (r.amount / mtotal) * 100 : 0).padStart(7)) +
+      c(ansi.dim, ('×' + r.count.toLocaleString('en-US')).padStart(8)) +
+      c(ansi.dim, ('$' + (r.count ? r.amount / r.count : 0).toFixed(2) + '/req').padStart(12));
+
     if (mrows.length) {
-      for (const r of mrows.slice(0, 5)) {
-        const share = mtotal > 0 ? (r.amount / mtotal) * 100 : 0;
+      add(c(ansi.dim, 'by model'));
+      for (const r of mrows.slice(0, 5)) add(statRow('model', r, shortModel));
+      add('');
+    }
+    // Attribution only exists for traffic seen after the gateway learned to
+    // record it, so scope this table to attributed spend and say so.
+    const attributed = prows.filter((r) => r.name !== 'unattributed');
+    const attrTotal = attributed.reduce((s, r) => s + r.amount, 0);
+    if (attributed.length) {
+      add(
+        c(ansi.dim, 'by project') +
+          c(ansi.dim, '  ' + moneyFine(attrTotal) + ' attributed'),
+      );
+      for (const r of attributed.slice(0, 4)) {
         add(
           '  ' +
-            padVisible(c(ansi.bold, shortModel(r.model)), 16) +
-            c(accent, sharePct(share).padStart(5)) +
-            c(ansi.dim, ('  −' + moneyFine(r.amount)).padStart(12)) +
-            c(ansi.dim, ('  ×' + r.count).padStart(7)) +
-            c(ansi.dim, '  $' + (r.count ? r.amount / r.count : 0).toFixed(2) + '/req'),
+            padVisible(c(ansi.bold, r.name), 22) +
+            c(ansi.dim, moneyFine(r.amount).padStart(10)) +
+            c(accent, sharePct(attrTotal > 0 ? (r.amount / attrTotal) * 100 : 0).padStart(7)) +
+            c(ansi.dim, ('×' + r.count.toLocaleString('en-US')).padStart(8)) +
+            c(ansi.dim, ('$' + (r.count ? r.amount / r.count : 0).toFixed(2) + '/req').padStart(12)),
         );
       }
       add('');
@@ -944,10 +1042,10 @@ function renderGlance(ctx) {
   const footerReserve = 1;
   const spare = rows - footerReserve - out.length;
   if (health.ok && spare >= 3) {
-    add(c(ansi.dim, 'live') + c(ansi.dim, '  newest last'));
+    add(c(ansi.dim, 'live') + c(ansi.dim, '  newest first'));
     const budget = Math.max(1, rows - footerReserve - out.length);
 
-    const tail = (ctx.feed || []).slice(-budget);
+    const tail = (ctx.feed || []).slice(-budget).reverse();
     if (!tail.length) {
       add(c(ansi.dim, 'waiting for traffic…'));
     } else {
@@ -1019,8 +1117,8 @@ export async function runWatch(opts = {}) {
   // Spread it across the recent window so the first frame is informative.
   /** @type {{ kind: string, [k: string]: any }[]} */
   const feed = [];
-  const pushFeed = (evs) => {
-    for (const ev of evs) feed.push(ev);
+  const pushFeed = (evs, at = Date.now()) => {
+    for (const ev of evs) feed.push(ev.at ? ev : { ...ev, at });
     if (feed.length > 500) feed.splice(0, feed.length - 500);
   };
 
@@ -1042,7 +1140,12 @@ export async function runWatch(opts = {}) {
       series.observe({ burn: ev.amount || 0, req: 1 }, nowMs - spanMs + i * step);
     });
     // Prime the feed so the panel opens with recent history, not a blank tail.
-    pushFeed((gw.recent || []).slice(-60));
+    // These lines have no clock of their own; spread them over the synthetic
+    // span so the timestamps stay ordered instead of all claiming "now".
+    const primed = (gw.recent || []).slice(-60);
+    primed.forEach((ev, i) => {
+      pushFeed([ev], nowMs - spanMs + ((i + 1) * spanMs) / (primed.length || 1));
+    });
   };
 
   try {

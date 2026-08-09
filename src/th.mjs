@@ -17,6 +17,7 @@ import { execFileSync } from 'node:child_process';
 import { PROJECT_ROOT, loadConfig } from './config.mjs';
 import { accountSnapshot } from './th-api.mjs';
 import { createLedger } from './ledger.mjs';
+import { runWatch } from './watch.mjs';
 
 function parseArgs(argv) {
   const positional = [];
@@ -438,6 +439,10 @@ async function accounts(json, live) {
 
 async function main() {
   const { command, subcommand, options } = parseArgs(process.argv.slice(2));
+  // Glance live panel (TTY). Also: th supply watch
+  if (command === 'watch' || (command === 'supply' && subcommand === 'watch') || (command === 'pool' && subcommand === 'live')) {
+    return runWatch({ once: options.json || process.env.TH_WATCH_ONCE === '1' });
+  }
   if (command === 'pool' && subcommand === 'usage') return usage(options.json, options.limit);
   if (command === 'pool' && subcommand === 'accounts') return accounts(options.json, options.live);
   if (command === 'pool' && (!subcommand || subcommand === 'status')) return status(options.json, options.live);
@@ -459,7 +464,7 @@ async function main() {
         );
   }
   console.error(
-    'usage: th pool status|usage|accounts [--json] [--live] [--limit N] | th supply status [--json] [--live]',
+    'usage: th watch | th pool status|usage|accounts|live [--json] [--live] [--limit N] | th supply status|watch [--json]',
   );
   process.exitCode = 2;
 }
