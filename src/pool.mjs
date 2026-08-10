@@ -31,6 +31,9 @@ import { nowIso } from './ledger.mjs';
 /** Default secrets dir, overridable per-instance. */
 const DEFAULT_SECRETS_DIR = join(process.env.HOME || '', '.pi', 'agent', 'secrets');
 
+/** Conversation pins kept in memory. Bounded; oldest pin is dropped first. */
+const MAX_AFFINITY_ENTRIES = 500;
+
 export class Pool {
   /**
    * @param {object} opts
@@ -55,6 +58,18 @@ export class Pool {
     /** @type {Map<string, object>} key -> record */
     this.keys = new Map();
     this.rr = 0; // round-robin cursor
+    /**
+     * Conversation affinity: prompt-prefix hash -> api key.
+     *
+     * Anthropic's prompt cache is scoped per account, so plain round-robin
+     * re-bills the entire prompt on every turn of a conversation. Pinning a
+     * conversation to one key keeps that cache warm. The pin needs no explicit
+     * invalidation: once the key leaves activeKeys() (exhausted/dead) the
+     * lookup below simply misses and the normal rotation takes over.
+     *
+     * @type {Map<string, string>}
+     */
+    this.affinity = new Map();
     this._load();
   }
 
@@ -338,13 +353,42 @@ export class Pool {
    * the pool is exhausted. `exclude` lets the gateway skip keys already tried
    * within the current request.
    */
-  borrowKey(exclude = new Set()) {
+  borrowKey(exclude = new Set(), affinityKey = null) {
     const active = this.activeKeys().filter((r) => !exclude.has(r.key));
     if (active.length === 0) return null;
+
+    let keepPin = false;
+    if (affinityKey) {
+      const pinnedKey = this.affinity.get(affinityKey);
+      const pinned = active.find((r) => r.key === pinnedKey);
+      if (pinned) {
+        pinned.lastUsed = nowIso();
+        return pinned;
+      }
+      // The pin exists but cannot serve this attempt. Only a genuine retirement
+      // (dead/exhausted) means the warm cache is gone for good; a transient 504
+      // or an exclude from an earlier attempt in *this* request does not. A warm
+      // prefix is worth far more than one retry, so keep the pin and let the
+      // conversation return to it on the next turn.
+      const stale = pinnedKey ? this.keys.get(pinnedKey) : undefined;
+      keepPin = !!stale && stale.status !== 'dead' && stale.status !== 'exhausted';
+      if (stale && !keepPin) this.affinity.delete(affinityKey);
+    }
+
     this.rr = (this.rr + 1) % active.length;
     const rec = active[this.rr];
     rec.lastUsed = nowIso();
+    if (affinityKey && !keepPin) this._pin(affinityKey, rec.key);
     return rec;
+  }
+
+  /** Remember which key serves a conversation, bounded so long uptime cannot leak. */
+  _pin(affinityKey, key) {
+    this.affinity.delete(affinityKey);
+    this.affinity.set(affinityKey, key);
+    while (this.affinity.size > MAX_AFFINITY_ENTRIES) {
+      this.affinity.delete(this.affinity.keys().next().value);
+    }
   }
 
   /**

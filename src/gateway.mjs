@@ -29,11 +29,42 @@
 // 403 code=balance_zero for an empty wallet, 401 for a dead key, 429 for quota.
 
 import { createServer } from 'node:http';
+import { createHash } from 'node:crypto';
 import { estimateCostUsd } from './pricing.mjs';
 
 const UPSTREAM = 'https://tokenharbor.ai/v1';
 const TIMEOUT = 120000; // upstream LLM calls can be slow
 const MAX_KEY_ATTEMPTS = 8; // give up after trying this many distinct keys
+
+/**
+ * Identify the conversation a request belongs to, so the pool can keep serving
+ * it from one key and keep the upstream prompt cache warm.
+ *
+ * The id hashes the immutable head of the prompt (system + first message) —
+ * exactly the span providers cache. Deliberately NOT the client's session id:
+ * the Anthropic path never parsed one, and the OpenAI path's regex over prompt
+ * text matches pi's own tool sources instead of the real working directory.
+ * Hashing the prompt head assumes nothing about the client.
+ *
+ * Compaction rewrites the first message, so the hash changes and the
+ * conversation is re-pinned. That is correct — the old cache is gone anyway.
+ *
+ * @returns {string|null} null when the body carries no usable prompt head
+ */
+export function conversationId(bodyBuf) {
+  try {
+    const j = JSON.parse(bodyBuf.toString('utf8'));
+    if (!j || typeof j !== 'object') return null;
+    const head = [j.system, Array.isArray(j.messages) ? j.messages[0] : null, Array.isArray(j.input) ? j.input[0] : null]
+      .filter((part) => part != null)
+      .map((part) => (typeof part === 'string' ? part : JSON.stringify(part)))
+      .join('\u0000');
+    if (!head) return null;
+    return createHash('sha256').update(head).digest('hex').slice(0, 16);
+  } catch {
+    return null;
+  }
+}
 
 function classify(status, code, message = '') {
   if (status === 401 || code === 'unauthorized') return 'dead';
@@ -156,6 +187,21 @@ function extractUsage(raw, streaming) {
   return usage;
 }
 
+/**
+ * Cache trace for the log line: which conversation the request belongs to and
+ * how the upstream billed its prompt. `miss` is the prompt span that had to be
+ * re-billed; a healthy pinned conversation keeps it near zero after the first
+ * turn. This is the only place cache behaviour is observable — providers expose
+ * no hit-rate API, only these per-response counters.
+ */
+function cacheTrace(requestMeta, usage) {
+  if (!requestMeta?.convo) return '';
+  const read = Number(usage?.cache_read_input_tokens ?? 0) || 0;
+  const write = Number(usage?.cache_creation_input_tokens ?? 0) || 0;
+  const fresh = Number(usage?.prompt_tokens ?? usage?.input_tokens ?? 0) || 0;
+  return `  convo=${requestMeta.convo} cache=${read}r/${write}w miss=${fresh}`;
+}
+
 function onSuccess(pool, rec, { model, raw, streaming, log, requestMeta = null }) {
   // Fact first (used once). Soft fill between $5 and $0 is optional interpolation.
   try {
@@ -177,7 +223,7 @@ function onSuccess(pool, rec, { model, raw, streaming, log, requestMeta = null }
           ? `  project=${encodeURIComponent(requestMeta.project)}${requestMeta.sessionId ? `  session=${encodeURIComponent(requestMeta.sessionId)}` : ''}`
           : '';
         log(
-          `${rec.file} (${rec.email || '?'}) -> 200  used  soft−${cost.toFixed(4)}  book=${Number(r.balance).toFixed(2)}  ${model || '?'}${route}`,
+          `${rec.file} (${rec.email || '?'}) -> 200  used  soft−${cost.toFixed(4)}  book=${Number(r.balance).toFixed(2)}  ${model || '?'}${cacheTrace(requestMeta, usage)}${route}`,
         );
         return;
       }
@@ -205,6 +251,7 @@ export function createGateway({
   async function handleMessages(req, res, bodyBuf, endpoint = 'messages') {
     bodyBuf = injectConfirmSpend(bodyBuf);
     const tried = new Set();
+    const convo = conversationId(bodyBuf);
     let lastHard = null;
     let model = null;
     let streaming = false;
@@ -247,8 +294,10 @@ export function createGateway({
       }
     };
 
+    // Only the first attempt honours affinity: once a key has failed for this
+    // request, retries must be free to land anywhere.
     for (let attempt = 0; attempt < maxKeyAttempts; attempt++) {
-      const rec = pool.borrowKey(tried);
+      const rec = pool.borrowKey(tried, attempt === 0 && !metering ? convo : null);
       if (!rec) {
         log(`pool exhausted after ${tried.size} Anthropic key attempt(s)`);
         try {
@@ -303,6 +352,7 @@ export function createGateway({
             raw: Buffer.concat(chunks).toString('utf8'),
             streaming,
             log,
+            requestMeta: { convo },
           });
         }
         return;
@@ -339,6 +389,7 @@ export function createGateway({
 
   async function handleOpenAI(req, res, bodyBuf, endpoint) {
     bodyBuf = injectConfirmSpend(bodyBuf);
+    const convo = conversationId(bodyBuf);
     // Record routing metadata only. Do not persist prompt contents.
     if (requestLog) {
       try {
@@ -411,8 +462,9 @@ export function createGateway({
       /* metadata is best effort */
     }
 
+    // See handleMessages: affinity applies to the first attempt only.
     for (let attempt = 0; attempt < maxKeyAttempts; attempt++) {
-      const rec = pool.borrowKey(tried);
+      const rec = pool.borrowKey(tried, attempt === 0 ? convo : null);
       if (!rec) {
         log(`pool exhausted after ${tried.size} key attempt(s)`);
         try {
@@ -463,7 +515,7 @@ export function createGateway({
           raw,
           streaming,
           log,
-          requestMeta,
+          requestMeta: { ...requestMeta, convo },
         });
         return;
       }
