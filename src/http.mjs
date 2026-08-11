@@ -125,6 +125,57 @@ export async function postSignup({ email, password, invite, fp, timezone = 'Asia
   });
 }
 
+/**
+ * Classify a non-303 signup response.
+ *
+ * The React-19 server action re-renders the signup page and puts its return
+ * value in the `$ACTION_1:1` hidden input (and in the flight payload). Reading
+ * only the first bytes of that HTML — as this project did until 2026-08-11 —
+ * makes every rejection look like an anonymous "checkpoint 200"; the body
+ * actually names the wall we hit. Measured classes:
+ *
+ *   rate_fast          shared cross-IP bucket is empty; rotating the exit IP
+ *                      does NOT help, only waiting does
+ *   rate_network_hour  this exit network is capped for ~1h; rotate the IP
+ *   unsupported        IP or email domain rejected by reputation; rotate the IP
+ *   validation         our own payload is wrong (checked BEFORE rate limits)
+ *   checkpoint         genuine Vercel challenge (no server-action payload)
+ */
+export function parseSignupReject(body) {
+  let message = null;
+  const m = body.match(/name="\$ACTION_1:1" value="(\[[^"]*\])"/);
+  if (m) {
+    const raw = m[1].replaceAll('&quot;', '"').replaceAll('&#x27;', "'").replaceAll('&amp;', '&');
+    try {
+      const parsed = JSON.parse(raw);
+      message = (Array.isArray(parsed) ? parsed[0] : parsed)?.error || null;
+    } catch {
+      message = raw.slice(0, 200);
+    }
+  }
+  const t = message || '';
+  const klass =
+    /bit fast/i.test(t) ? 'rate_fast'
+    : /too many sign-?ups/i.test(t) ? 'rate_network_hour'
+    : /not supported/i.test(t) ? 'unsupported'
+    : /captcha|turnstile/i.test(t) ? 'captcha'
+    : /password|email|invite|required|characters/i.test(t) ? 'validation'
+    : message ? 'rejected'
+    : /Security Checkpoint|challenge-platform|__vercel_challenge/i.test(body) ? 'checkpoint'
+    : 'unknown';
+  return { klass, message };
+}
+
+/** Best-effort egress IP for the current proxy (tiny request; null on failure). */
+export async function fetchEgressIp({ proxy }) {
+  try {
+    const r = await httpRequest({ method: 'GET', url: 'https://api.ipify.org?format=json', proxy, timeout: 12000 });
+    return JSON.parse(r.body)?.ip || null;
+  } catch {
+    return null;
+  }
+}
+
 /** Open a verify link; returns redirect URL (expect /dashboard?verify=success). */
 export async function openVerify(link, { jar, proxy }) {
   return httpRequest({ method: 'GET', url: link, jar, proxy, timeout: 20000 });

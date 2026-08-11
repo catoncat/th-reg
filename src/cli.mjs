@@ -14,6 +14,7 @@ import { appendAccount, printAccount } from './accounts.mjs';
 import { stickyEndpoint, rotateEndpoint } from './config.mjs';
 import { generateUsername } from './names.mjs';
 import { DomainAllocator, loadCfEnv } from './domains.mjs';
+import { createSignupPacer } from './pacer.mjs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { sleep } from './mailbox.mjs';
@@ -137,6 +138,15 @@ async function main() {
   // prepare the domain pool (pull historical dynamic domains + top-up if needed)
   await allocator.init();
 
+  // Signup submits are rate-limited server-side across exit IPs (measured
+  // 2026-08-11), so all workers share one adaptive pacer for that step only.
+  const pacer = createSignupPacer({
+    minGapMs: cfg.signupMinGapMs,
+    startGapMs: cfg.signupStartGapMs,
+    maxGapMs: cfg.signupMaxGapMs,
+    log: (m) => console.log(`  ${m}`),
+  });
+
   // `usable` is the only number that matters: verified + key + funded.
   const created = { created: 0, verified: 0, usable: 0, failed: 0 };
   const usedNames = new Set();
@@ -151,7 +161,7 @@ async function main() {
     try {
       const domain = await allocator.next();
       email = `${job.username}@${domain}`;
-      const r = await engine.registerOne(cfg, { email, password: job.password, log: (m) => console.log(`  ${m}`) });
+      const r = await engine.registerOne(cfg, { email, password: job.password, log: (m) => console.log(`  ${m}`), pacer });
       r.password = job.password;
       appendAccount(cfg.accountsFile, r);
       printAccount(r);
@@ -188,6 +198,9 @@ async function main() {
 
   console.log(
     `\n[summary] usable=${created.usable} (verified+key+funded) | created=${created.created} verified=${created.verified} failed=${created.failed} -> ${cfg.accountsFile}`
+  );
+  console.log(
+    `[pace] submits=${pacer.stats.slots} ok=${pacer.stats.ok} rate-limited=${pacer.stats.fast} other=${pacer.stats.other} final gap=${(pacer.gapMs / 1000).toFixed(1)}s`
   );
   if (created.usable < created.created) {
     console.log('[note] accounts short of "usable" are missing verification, a key, or the $5 grant.');

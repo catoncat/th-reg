@@ -90,6 +90,11 @@ export function loadConfig(overrides = {}) {
     supplyLowWatermark: Number(env.TH_SUPPLY_LOW_WATERMARK || 1.0),
     // Concurrent register workers inside one supply run (claim∥key already parallel per account).
     supplyWorkers: Number(env.TH_SUPPLY_WORKERS || 3),
+    // Signup submit pacing (see src/pacer.mjs). The endpoint rate-limits across
+    // exit IPs, so the submit step is serialized and its gap adapts AIMD-style.
+    signupMinGapMs: Number(env.TH_SIGNUP_MIN_GAP_MS || 4000),
+    signupStartGapMs: Number(env.TH_SIGNUP_START_GAP_MS || 15000),
+    signupMaxGapMs: Number(env.TH_SIGNUP_MAX_GAP_MS || 240000),
     ...overrides,
   };
 

@@ -37,10 +37,13 @@ import { createMailProvider, sleep } from './mailbox.mjs';
 import { randomHex } from './config.mjs';
 import { randomUUID } from 'node:crypto';
 import { rmSync } from 'node:fs';
+import { nullPacer } from './pacer.mjs';
 import {
   resolveProxy,
   httpRequest,
   fetchActionPage,
+  parseSignupReject,
+  fetchEgressIp,
   signupPrecheck,
   postSignup,
   openVerify,
@@ -55,7 +58,7 @@ import {
 
 export { SIGNUP_URL, HOST };
 
-export async function registerOne(cfg, { email, password, log = () => {} }) {
+export async function registerOne(cfg, { email, password, log = () => {}, pacer = nullPacer() }) {
   const mail = createMailProvider(cfg.mailMode, { cli: cfg.mailboxCli });
 
   const result = {
@@ -86,16 +89,30 @@ export async function registerOne(cfg, { email, password, log = () => {} }) {
   };
 
   try {
-    const MAX_SIGNUP_ATTEMPTS = 2; // initial + one fresh-session retry
+    // Retries only help for walls tied to THIS exit IP or to a flaky tunnel.
+    // A 'rate_fast' rejection is the shared cross-IP bucket (measured), so
+    // retrying — with or without a new IP — only burns time; pacing is the
+    // caller's job.
+    const MAX_SIGNUP_ATTEMPTS = 3;
+    const ROTATE_WORTH = new Set(['rate_network_hour', 'unsupported', 'transport', 'pagefail']);
     let created = false;
     let lastSignupErr = null;
+    let lastClass = null;
 
     for (let attempt = 1; attempt <= MAX_SIGNUP_ATTEMPTS; attempt++) {
+      lastClass = null;
       try {
-        // 1. signup page (jar must be shared with the POST below)
-        const page = await fetchActionPage({ jar, proxy });
+        // Serialize the submit step across workers (shared server-side bucket).
+        await pacer.slot();
+        // 1. signup page (jar must be shared with the POST below) + egress IP
+        const [page, egressIp] = await Promise.all([
+          fetchActionPage({ jar, proxy }),
+          proxy ? fetchEgressIp({ proxy }) : Promise.resolve(null),
+        ]);
+        if (egressIp) result.egress_ip = egressIp;
         if (!page.key || page.status !== 200) {
           lastSignupErr = `signup page fetch failed (http ${page.status})`;
+          lastClass = 'pagefail';
           log(`[!] ${lastSignupErr}`);
         } else {
           const fp = randomUUID();
@@ -119,22 +136,33 @@ export async function registerOne(cfg, { email, password, log = () => {} }) {
           if (r.code === 303) {
             result.status = 'created';
             if (attempt > 1) result.signup_retries = attempt - 1;
+            pacer.report('ok');
             log(`[+] account created (303 -> ${r.location})${attempt > 1 ? ` after ${attempt - 1} session retry` : ''}`);
             created = true;
             break;
           }
-          // Classic checkpoint / soft reject: 200 + signup HTML, no session.
-          lastSignupErr = `signup http ${r.code} ${r.body.slice(0, 160)}`;
-          log(`[!] signup http ${r.code}`);
+          // Non-303: the server action re-rendered the page and named the wall.
+          const rej = parseSignupReject(r.body);
+          lastClass = rej.klass;
+          lastSignupErr = `${rej.klass}${rej.message ? ': ' + rej.message : ` (http ${r.code}, unparsed)`}`;
+          result.reject_class = rej.klass;
+          pacer.report(rej.klass);
+          log(`[!] signup rejected ${lastSignupErr}`);
         }
       } catch (err) {
         // Proxy SSL / tunnel / timeout during signup — retryable via new sticky IP.
+        lastClass = 'transport';
         lastSignupErr = err?.message?.split('\n')[0]?.slice(0, 160) || String(err);
+        pacer.report('transport');
         log(`[!] signup transport: ${lastSignupErr}`);
       }
 
       if (created || attempt >= MAX_SIGNUP_ATTEMPTS) break;
-      log(`[·] rotating sticky session (attempt ${attempt + 1}/${MAX_SIGNUP_ATTEMPTS})`);
+      if (!ROTATE_WORTH.has(lastClass)) {
+        log(`[·] no in-place retry for ${lastClass} (a fresh IP changes nothing); caller backs off`);
+        break;
+      }
+      log(`[·] rotating sticky session (attempt ${attempt + 1}/${MAX_SIGNUP_ATTEMPTS}, was ${lastClass})`);
       rotateSession();
       await sleep(400);
     }
@@ -142,6 +170,7 @@ export async function registerOne(cfg, { email, password, log = () => {} }) {
     if (!created) {
       result.status = 'failed';
       result.error = lastSignupErr || 'signup failed';
+      if (lastClass) result.reject_class = lastClass;
       return result;
     }
 
@@ -158,8 +187,13 @@ export async function registerOne(cfg, { email, password, log = () => {} }) {
     }
 
     // Ask the app to send the mail (signup alone does not reliably send it).
-    const sent = await sendVerificationEmail({ jar, proxy });
-    log(`[·] verification email requested (http ${sent.code})`);
+    // A dead proxy tunnel here used to throw away a perfectly good account, so
+    // this is retried and, if it still fails, we fall through to the mailbox
+    // poll anyway (the mail may already be on its way).
+    const sent = await withRetry(() => sendVerificationEmail({ jar, proxy }), 2, (m) =>
+      log(`[!] send-verification-email retry: ${m}`),
+    );
+    log(sent ? `[·] verification email requested (http ${sent.code})` : '[!] send-verification-email failed; polling the mailbox anyway');
 
     let link = null;
     try {
@@ -212,8 +246,9 @@ export async function postRegisterSetupHTTP(cfg, { jar, proxy, result, password,
   // After verify, claim / API key / free-models only need the session cookie.
   // Run them concurrently (async curl). free-models is best-effort and must
   // not block a funded paid-route account (opus etc. do not need it).
-  const claimP = claimWelcomeGrant({ jar, proxy })
+  const claimP = withRetry(() => claimWelcomeGrant({ jar, proxy }), 2)
     .then((cr) => {
+      if (!cr) return { cr: { code: 0 }, claimed: null, error: 'transport' };
       let claimed = null;
       try {
         claimed = JSON.parse(cr.body);
@@ -224,8 +259,9 @@ export async function postRegisterSetupHTTP(cfg, { jar, proxy, result, password,
     })
     .catch((e) => ({ cr: { code: 0 }, claimed: null, error: e.message }));
 
-  const keyP = createApiKey({ label: 'bot-key', jar, proxy })
+  const keyP = withRetry(() => createApiKey({ label: 'bot-key', jar, proxy }), 2)
     .then((kr) => {
+      if (!kr) return { kr: { code: 0 }, plaintext: null, error: 'transport' };
       let plaintext = null;
       if (kr.code === 200 || kr.code === 201) {
         try {
@@ -292,6 +328,29 @@ export async function postRegisterSetupHTTP(cfg, { jar, proxy, result, password,
   }
 }
 
+
+/**
+ * Retry a request that only failed at the transport layer (dead residential
+ * tunnel, timeout). Returns null when every attempt failed — callers decide
+ * whether that is fatal. Session cookies are not IP-bound, so retrying on the
+ * same jar is safe.
+ */
+async function withRetry(fn, attempts = 2, onRetry = () => {}) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (i + 1 < attempts) {
+        onRetry(String(err?.message || err).split('\n')[0].slice(0, 100));
+        await sleep(800);
+      }
+    }
+  }
+  void lastErr;
+  return null;
+}
 
 function maskProxy(url) {
   return url.replace(/:\/\/[^@]+@/, '://***:***@');

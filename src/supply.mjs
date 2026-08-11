@@ -23,6 +23,7 @@ import { registerOne } from './register.mjs';
 import { generateUsername } from './names.mjs';
 import { DomainAllocator, loadCfEnv } from './domains.mjs';
 import { accountSnapshot } from './th-api.mjs';
+import { createSignupPacer } from './pacer.mjs';
 import { sleep } from './mailbox.mjs';
 
 const log = (m) => console.log(`[supply] ${m}`);
@@ -137,12 +138,12 @@ function appendAccount(accountsFile, rec) {
  * Register one fully-usable account end-to-end (domain + username + the pure
  * protocol chain), persist it, and return the record — or null on failure.
  */
-async function registerUsable(cfg, allocator, usedNames, log) {
+async function registerUsable(cfg, allocator, usedNames, log, pacer) {
   const username = generateUsername(usedNames);
   const password = `TH_${randomHex(8)}!x9`;
   const domain = await allocator.next();
   const email = `${username}@${domain}`;
-  const r = await registerOne(cfg, { email, password, log: (m) => log(`  ${m}`) });
+  const r = await registerOne(cfg, { email, password, log: (m) => log(`  ${m}`), pacer });
   r.password = password;
   appendAccount(cfg.accountsFile, r);
   let balance = 0;
@@ -158,9 +159,9 @@ async function registerUsable(cfg, allocator, usedNames, log) {
     persistKey(r.api_key, cfg);
     log(`  [+] funded account ready: ${email} (${balance.toFixed(2)})`);
   } else {
-    log(`  [!] ${email} not usable (status=${r.status} key=${!!r.api_key} balance=${balance.toFixed(2)})`);
+    log(`  [!] ${email} not usable (status=${r.status}${r.reject_class ? ' ' + r.reject_class : ''} key=${!!r.api_key} balance=${balance.toFixed(2)})`);
   }
-  return usable ? { ...r, _balance: balance } : null;
+  return { usable, rec: usable ? { ...r, _balance: balance } : null, rejectClass: r.reject_class || null };
 }
 
 /**
@@ -244,7 +245,18 @@ export async function supply({ cfg, targetUsd, lowWatermark, maxAdds = 60, worke
   const usedNames = new Set(accounts.map((a) => (a.email || '').split('@')[0]));
   let added = 0;
   let consecFail = 0;
+  let rateRejects = 0;
+  // Rate-limit rejections are expected weather, not a broken run: the pacer
+  // backs off and we keep going. Only non-rate failures (captcha, bad payload,
+  // dead proxy) count toward the give-up streak.
   const MAX_CONSEC_FAIL = Math.max(4, workers * 2);
+  const MAX_RATE_REJECTS = Number(process.env.TH_MAX_RATE_REJECTS || 25);
+  const pacer = createSignupPacer({
+    minGapMs: cfg.signupMinGapMs,
+    startGapMs: cfg.signupStartGapMs,
+    maxGapMs: cfg.signupMaxGapMs,
+    log,
+  });
   // Shared counter lock (JS single-threaded; mutex serializes critical sections across awaits)
   let chain = Promise.resolve();
   const withLock = (fn) => {
@@ -261,6 +273,7 @@ export async function supply({ cfg, targetUsd, lowWatermark, maxAdds = 60, worke
     while (true) {
       const proceed = await withLock(async () => {
         if (total >= targetUsd || added >= maxAdds || consecFail >= MAX_CONSEC_FAIL) return false;
+        if (rateRejects >= MAX_RATE_REJECTS) return false;
         log(
           `[w${id}] below target by $${(targetUsd - total).toFixed(2)} (added=${added}/${maxAdds}, failStreak=${consecFail}); registering...`,
         );
@@ -268,10 +281,12 @@ export async function supply({ cfg, targetUsd, lowWatermark, maxAdds = 60, worke
       });
       if (!proceed) break;
 
-      const r = await registerUsable(cfg, allocator, usedNames, (m) => log(`[w${id}]${m.startsWith(' ') ? '' : ' '}${m}`)).catch((e) => {
+      const out = await registerUsable(cfg, allocator, usedNames, (m) => log(`[w${id}]${m.startsWith(' ') ? '' : ' '}${m}`), pacer).catch((e) => {
         log(`  [w${id}] [fail] register: ${e.message}`);
-        return null;
+        return { usable: false, rec: null, rejectClass: 'exception' };
       });
+      const r = out?.rec || null;
+      const rateRejected = out?.rejectClass === 'rate_fast' || out?.rejectClass === 'rate_network_hour';
 
       await withLock(async () => {
         if (r) {
@@ -283,16 +298,17 @@ export async function supply({ cfg, targetUsd, lowWatermark, maxAdds = 60, worke
             setCurrentKey(r.api_key, cfg);
             log(`[w${id}] current -> ${r.email} ($${(r._balance || 5).toFixed(2)})`);
           }
+        } else if (rateRejected) {
+          rateRejects++;
+          log(`  [w${id}] [retry] rate-limited (${out.rejectClass}) ${rateRejects}/${MAX_RATE_REJECTS}; pacer gap ${(pacer.gapMs / 1000).toFixed(1)}s`);
         } else {
           consecFail++;
           log(`  [w${id}] [retry] failStreak ${consecFail}/${MAX_CONSEC_FAIL}`);
         }
       });
 
-      // Adaptive pacing: mail RTT already bounds success rate. Only back off
-      // hard after a real failure (captcha / bad proxy / checkpoint exhausted).
-      const pace = r ? cfg.delayMs : Math.max(cfg.delayMs * 3, 4000);
-      await sleep(pace);
+      // The pacer owns signup spacing now; this is only anti-spin.
+      await sleep(r ? cfg.delayMs : 500);
     }
   }
 
@@ -301,6 +317,13 @@ export async function supply({ cfg, targetUsd, lowWatermark, maxAdds = 60, worke
   if (consecFail >= MAX_CONSEC_FAIL) {
     log(`stopped after failStreak ${MAX_CONSEC_FAIL} (likely captcha/proxy); pool $${total.toFixed(2)}`);
   }
-  log(`done: +${added} account(s); pool now ~$${total.toFixed(2)} (workers=${workers})`);
+  if (rateRejects >= MAX_RATE_REJECTS) {
+    log(`stopped after ${rateRejects} rate-limit rejections; the signup bucket is dry — next scheduled run retries`);
+  }
+  log(
+    `done: +${added} account(s); pool now ~$${total.toFixed(2)} (workers=${workers}, ` +
+      `submits=${pacer.stats.slots} ok=${pacer.stats.ok} rate=${pacer.stats.fast} other=${pacer.stats.other}, ` +
+      `final gap ${(pacer.gapMs / 1000).toFixed(1)}s)`,
+  );
   return { added, total, funded };
 }
