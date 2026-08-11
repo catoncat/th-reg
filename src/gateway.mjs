@@ -71,6 +71,11 @@ function classify(status, code, message = '') {
   const failureText = `${code || ''} ${message || ''}`;
   if (status === 402 || code === 'balance_zero' || /insufficient|balance|top up/i.test(failureText)) return 'balance';
   if (status === 429 || /rate|limit|quota/i.test(failureText)) return 'quota';
+  // Pooled accounts do not share one real context window: some backing
+  // accounts reject prompts far below the model's advertised size. This is a
+  // per-key capacity fault, not a genuine oversized request, so it must
+  // rotate to another key instead of being handed straight to the client.
+  if (status === 400 && /context window|context_length/i.test(failureText)) return 'context_window';
   if (status >= 500 || status === 0) return 'network';
   return 'unknown';
 }
@@ -158,7 +163,7 @@ function responseHeaders(upstream) {
 }
 
 function isRetryable(status, reason) {
-  return reason === 'dead' || reason === 'balance' || reason === 'quota' || status >= 500;
+  return reason === 'dead' || reason === 'balance' || reason === 'quota' || reason === 'context_window' || status >= 500;
 }
 
 /** Pull OpenAI-style usage from a buffered non-stream or SSE body. */
