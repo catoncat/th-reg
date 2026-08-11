@@ -32,6 +32,14 @@ import { nowIso } from './ledger.mjs';
 const DEFAULT_SECRETS_DIR = join(process.env.HOME || '', '.pi', 'agent', 'secrets');
 
 /** Conversation pins kept in memory. Bounded; oldest pin is dropped first. */
+/**
+ * How long a key stays parked after an upstream risk hold (402
+ * confidence_level_required) before it is retried. Short enough that a wave of
+ * holds clears on its own, long enough that a held key is not re-probed by
+ * every request. Override with TH_FLAGGED_COOLDOWN_MS.
+ */
+const FLAGGED_COOLDOWN_MS = Number(process.env.TH_FLAGGED_COOLDOWN_MS) || 30 * 60 * 1000;
+
 const MAX_AFFINITY_ENTRIES = 500;
 
 export class Pool {
@@ -238,7 +246,18 @@ export class Pool {
 
   /** Keys currently eligible to serve a request. */
   activeKeys() {
-    return this.all().filter((r) => r.status === 'ok' || r.status === 'quota');
+    const flaggedFloor = Date.now() - FLAGGED_COOLDOWN_MS;
+    return this.all().filter((r) => {
+      if (r.status === 'ok' || r.status === 'quota') return true;
+      // A risk hold is not a verdict: the same keys that were refused have been
+      // observed serving traffic again ~20min later. So park a flagged key long
+      // enough that the pool stops paying to rediscover it on every request,
+      // then let it back in. If it is still held it gets flagged again, which
+      // makes this a self-tuning backoff rather than a death sentence.
+      if (r.status !== 'flagged') return false;
+      const since = Date.parse(r.flaggedAt || '') || 0;
+      return since > 0 && since < flaggedFloor;
+    });
   }
 
   /** Keys held back by an upstream risk hold — money intact, cannot be spent. */
@@ -467,6 +486,7 @@ export class Pool {
         rec.status = 'quota';
         // quota is not a balance fact — leave balance alone, no ledger write
       } else if (outcome.reason === 'flagged') {
+        rec.flaggedAt = at;
         // Account risk hold (402 confidence_level_required). The money is still
         // there but we cannot spend it, so: drop out of the paid rotation like a
         // retired key, keep the balance figure honest, and write no ledger event.

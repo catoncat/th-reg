@@ -206,7 +206,7 @@ test('gateway rotates on a 402 api_error that is not a real balance signal, with
   }
 });
 
-test('gateway rotates on a 402 confidence_level_required without retiring the key', async () => {
+test('gateway rotates on a 402 confidence_level_required and parks the key instead of retiring it', async () => {
   const attempts = [];
   const upstream = createServer(async (req, res) => {
     const key = req.headers.authorization?.replace('Bearer ', '') || req.headers['x-api-key'];
@@ -229,7 +229,12 @@ test('gateway rotates on a 402 confidence_level_required without retiring the ke
     });
     assert.equal(response.status, 200);
     assert.deepEqual(attempts, ['key-one', 'key-two']);
-    assert.equal(keyPool.reports[0].reason, 'soft_402');
+    // 'flagged', not 'soft_402': a risk hold does not clear inside one request,
+    // so leaving the key in rotation makes every later request rediscover it
+    // (measured: 107 rotations per 200 log lines while ~20% of the pool was
+    // held). Pool parks it without retiring it — balance untouched, no ledger
+    // event, back in rotation after FLAGGED_COOLDOWN_MS.
+    assert.equal(keyPool.reports[0].reason, 'flagged');
   } finally {
     await close(gateway);
     await close(upstream);

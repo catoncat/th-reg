@@ -77,6 +77,20 @@ function classify(status, code, message = '') {
   // rotate to another key instead of being handed straight to the client.
   if (status === 400 && /context window|context_length/i.test(failureText)) return 'context_window';
   if (status >= 500 || status === 0) return 'network';
+  // Two 402 codes are known and need their own handling, so they are matched
+  // before the generic soft_402 fallback below.
+  //   confidence_level_required -> account risk hold. The wallet is untouched
+  //     but every paid call is refused ("we can't serve our models on this
+  //     account right now", plus a Discord appeal code), and it does not clear
+  //     on its own within a request. Treating it as soft_402 keeps the key in
+  //     rotation, so every later request pays to rediscover it — 107 rotations
+  //     per 200 log lines when this was ~20% of the pool. 'flagged' parks it
+  //     without pretending the money is gone (see Pool: no ledger write, no
+  //     zeroing, excluded from totalBalance).
+  //   insufficient_quota -> daily request quota, comes back on reset, which is
+  //     exactly what 'quota' already means.
+  if (code === 'confidence_level_required' || /confidence_level/i.test(failureText)) return 'flagged';
+  if (code === 'insufficient_quota') return 'quota';
   // Upstream overloads HTTP 402/403 with unrelated business errors (e.g.
   // api_error, confidence_level_required, permission_error) that have
   // nothing to do with the key's actual balance. Only a code/message that
@@ -170,7 +184,15 @@ function responseHeaders(upstream) {
 }
 
 function isRetryable(status, reason) {
-  return reason === 'dead' || reason === 'balance' || reason === 'quota' || reason === 'context_window' || reason === 'soft_402' || status >= 500;
+  return (
+    reason === 'dead' ||
+    reason === 'balance' ||
+    reason === 'quota' ||
+    reason === 'flagged' ||
+    reason === 'context_window' ||
+    reason === 'soft_402' ||
+    status >= 500
+  );
 }
 
 /** Pull OpenAI-style usage from a buffered non-stream or SSE body. */
