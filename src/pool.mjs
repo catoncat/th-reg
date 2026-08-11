@@ -241,6 +241,11 @@ export class Pool {
     return this.all().filter((r) => r.status === 'ok' || r.status === 'quota');
   }
 
+  /** Keys held back by an upstream risk hold — money intact, cannot be spent. */
+  flaggedKeys() {
+    return this.all().filter((r) => r.status === 'flagged');
+  }
+
   activeCount() {
     return this.activeKeys().length;
   }
@@ -267,6 +272,7 @@ export class Pool {
     let exhaustedKeys = 0;
     let deadKeys = 0;
     let quotaKeys = 0;
+    let flaggedKeys = 0;
     const keys = [];
 
     let currentKey = '';
@@ -285,6 +291,7 @@ export class Pool {
       if (r.used || retired) usedKeys++;
       if (r.status === 'dead') deadKeys++;
       else if (r.status === 'exhausted') exhaustedKeys++;
+      else if (r.status === 'flagged') flaggedKeys++;
       else if (r.status === 'quota') {
         quotaKeys++;
         activeKeys++;
@@ -297,6 +304,12 @@ export class Pool {
       let balanceKnown = false;
       if (retired) {
         balance = 0;
+        balanceKnown = true;
+        knownBalanceKeys++;
+      } else if (r.status === 'flagged') {
+        // Report the real figure so an appeal can be valued, but keep it out of
+        // totalBalance: supply must see the spendable head-room, not held money.
+        balance = r.balance != null ? Number(r.balance) || 0 : 5;
         balanceKnown = true;
         knownBalanceKeys++;
       } else if (r.balance != null) {
@@ -335,6 +348,7 @@ export class Pool {
       exhaustedKeys,
       deadKeys,
       quotaKeys,
+      flaggedKeys,
       totalKeys: keys.length,
       totalBalance: Math.round(totalBalance * 100) / 100,
       knownBalanceKeys,
@@ -371,7 +385,7 @@ export class Pool {
       // prefix is worth far more than one retry, so keep the pin and let the
       // conversation return to it on the next turn.
       const stale = pinnedKey ? this.keys.get(pinnedKey) : undefined;
-      keepPin = !!stale && stale.status !== 'dead' && stale.status !== 'exhausted';
+      keepPin = !!stale && stale.status !== 'dead' && stale.status !== 'exhausted' && stale.status !== 'flagged';
       if (stale && !keepPin) this.affinity.delete(affinityKey);
     }
 
@@ -452,6 +466,13 @@ export class Pool {
       } else if (outcome.reason === 'quota') {
         rec.status = 'quota';
         // quota is not a balance fact — leave balance alone, no ledger write
+      } else if (outcome.reason === 'flagged') {
+        // Account risk hold (402 confidence_level_required). The money is still
+        // there but we cannot spend it, so: drop out of the paid rotation like a
+        // retired key, keep the balance figure honest, and write no ledger event.
+        // Kept distinct from 'exhausted' so a later appeal/expiry can revive it
+        // and so supply does not read the held money as available head-room.
+        rec.status = 'flagged';
       }
       // network/unknown: leave status, just record the error (transient)
     }

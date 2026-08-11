@@ -69,7 +69,7 @@ export function conversationId(bodyBuf) {
 function classify(status, code, message = '') {
   if (status === 401 || code === 'unauthorized') return 'dead';
   const failureText = `${code || ''} ${message || ''}`;
-  if (status === 402 || code === 'balance_zero' || /insufficient|balance|top up/i.test(failureText)) return 'balance';
+  if (code === 'balance_zero' || /insufficient|balance|top up/i.test(failureText)) return 'balance';
   if (status === 429 || /rate|limit|quota/i.test(failureText)) return 'quota';
   // Pooled accounts do not share one real context window: some backing
   // accounts reject prompts far below the model's advertised size. This is a
@@ -77,6 +77,13 @@ function classify(status, code, message = '') {
   // rotate to another key instead of being handed straight to the client.
   if (status === 400 && /context window|context_length/i.test(failureText)) return 'context_window';
   if (status >= 500 || status === 0) return 'network';
+  // Upstream overloads HTTP 402/403 with unrelated business errors (e.g.
+  // api_error, confidence_level_required, permission_error) that have
+  // nothing to do with the key's actual balance. Only a code/message that
+  // names balance/insufficiency (matched above) proves the key is spent —
+  // any other 402/403 must rotate to the next key WITHOUT retiring this one,
+  // or a transient upstream fault permanently kills a fully-funded key.
+  if (status === 402 || status === 403) return 'soft_402';
   return 'unknown';
 }
 
@@ -163,7 +170,7 @@ function responseHeaders(upstream) {
 }
 
 function isRetryable(status, reason) {
-  return reason === 'dead' || reason === 'balance' || reason === 'quota' || reason === 'context_window' || status >= 500;
+  return reason === 'dead' || reason === 'balance' || reason === 'quota' || reason === 'context_window' || reason === 'soft_402' || status >= 500;
 }
 
 /** Pull OpenAI-style usage from a buffered non-stream or SSE body. */
