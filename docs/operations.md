@@ -114,3 +114,7 @@ every 30 minutes; the same idea ports to cron or a container.
 - The read-only CLI never prints credentials; it exposes account facts only.
 - Nothing here bypasses CAPTCHA: accounts that hit `needCaptcha` are skipped.
 - This is reference architecture, not a promised SLA — measure, adapt, reuse.
+
+## Related
+
+- `docs/orchestra.md` — th-orchestra smart routing: pool map, per-account override API, two confirmed upstream bugs (integration on hold), and the `/api/verify` ground-truth tool.
