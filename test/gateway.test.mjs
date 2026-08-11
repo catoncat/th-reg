@@ -176,6 +176,97 @@ test('gateway rotates on balance-zero 403 expressed only in error.message', asyn
   }
 });
 
+test('gateway rotates on a 402 api_error that is not a real balance signal, without retiring the key', async () => {
+  const attempts = [];
+  const upstream = createServer(async (req, res) => {
+    const key = req.headers.authorization?.replace('Bearer ', '') || req.headers['x-api-key'];
+    attempts.push(key);
+    res.writeHead(key === 'key-one' ? 402 : 200, { 'content-type': 'application/json' });
+    if (key === 'key-one') {
+      return res.end(JSON.stringify({ error: { type: 'api_error', message: 'temporary upstream fault' } }));
+    }
+    res.end(JSON.stringify({ id: 'ok', usage: { input_tokens: 1, output_tokens: 1 } }));
+  });
+  const upstreamOrigin = await listen(upstream);
+  const keyPool = pool(['key-one', 'key-two']);
+  const gateway = createGateway({ pool: keyPool, upstreamBase: `${upstreamOrigin}/v1` });
+  const gatewayOrigin = await listen(gateway);
+  try {
+    const response = await fetch(`${gatewayOrigin}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(attempts, ['key-one', 'key-two']);
+    assert.equal(keyPool.reports[0].reason, 'soft_402');
+  } finally {
+    await close(gateway);
+    await close(upstream);
+  }
+});
+
+test('gateway rotates on a 402 confidence_level_required without retiring the key', async () => {
+  const attempts = [];
+  const upstream = createServer(async (req, res) => {
+    const key = req.headers.authorization?.replace('Bearer ', '') || req.headers['x-api-key'];
+    attempts.push(key);
+    res.writeHead(key === 'key-one' ? 402 : 200, { 'content-type': 'application/json' });
+    if (key === 'key-one') {
+      return res.end(JSON.stringify({ error: { type: 'confidence_level_required', message: 'confirm spend estimate' } }));
+    }
+    res.end(JSON.stringify({ id: 'ok', usage: { input_tokens: 1, output_tokens: 1 } }));
+  });
+  const upstreamOrigin = await listen(upstream);
+  const keyPool = pool(['key-one', 'key-two']);
+  const gateway = createGateway({ pool: keyPool, upstreamBase: `${upstreamOrigin}/v1` });
+  const gatewayOrigin = await listen(gateway);
+  try {
+    const response = await fetch(`${gatewayOrigin}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(attempts, ['key-one', 'key-two']);
+    assert.equal(keyPool.reports[0].reason, 'soft_402');
+  } finally {
+    await close(gateway);
+    await close(upstream);
+  }
+});
+
+test('gateway still retires a genuine 402 balance_zero code', async () => {
+  const attempts = [];
+  const upstream = createServer(async (req, res) => {
+    const key = req.headers.authorization?.replace('Bearer ', '') || req.headers['x-api-key'];
+    attempts.push(key);
+    res.writeHead(key === 'key-one' ? 402 : 200, { 'content-type': 'application/json' });
+    if (key === 'key-one') {
+      return res.end(JSON.stringify({ error: { code: 'balance_zero', message: 'Your Token Harbor balance is at $0.' } }));
+    }
+    res.end(JSON.stringify({ id: 'ok', usage: { input_tokens: 1, output_tokens: 1 } }));
+  });
+  const upstreamOrigin = await listen(upstream);
+  const keyPool = pool(['key-one', 'key-two']);
+  const gateway = createGateway({ pool: keyPool, upstreamBase: `${upstreamOrigin}/v1` });
+  const gatewayOrigin = await listen(gateway);
+  try {
+    const response = await fetch(`${gatewayOrigin}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(attempts, ['key-one', 'key-two']);
+    assert.equal(keyPool.reports[0].reason, 'balance');
+  } finally {
+    await close(gateway);
+    await close(upstream);
+  }
+});
+
+
 test('gateway rotates on a per-key context-window 400 but preserves other 400s verbatim', async () => {
   const attempts = [];
   const upstream = createServer(async (req, res) => {
