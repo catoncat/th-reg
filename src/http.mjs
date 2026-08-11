@@ -159,6 +159,10 @@ export function parseSignupReject(body) {
     : /too many sign-?ups/i.test(t) ? 'rate_network_hour'
     : /not supported/i.test(t) ? 'unsupported'
     : /captcha|turnstile/i.test(t) ? 'captcha'
+    // Server-side hiccup, explicitly "try again in a minute". Must be tested
+    // BEFORE validation: the text ends in "email support@tokenharbor.ai", and a
+    // naive /email/ check files it as our own bad payload.
+    : /couldn't create your account|team has been alerted/i.test(t) ? 'server_error'
     : /password|email|invite|required|characters/i.test(t) ? 'validation'
     : message ? 'rejected'
     : /Security Checkpoint|challenge-platform|__vercel_challenge/i.test(body) ? 'checkpoint'

@@ -94,7 +94,7 @@ export async function registerOne(cfg, { email, password, log = () => {}, pacer 
     // retrying — with or without a new IP — only burns time; pacing is the
     // caller's job.
     const MAX_SIGNUP_ATTEMPTS = 3;
-    const ROTATE_WORTH = new Set(['rate_network_hour', 'unsupported', 'transport', 'pagefail']);
+    const ROTATE_WORTH = new Set(['rate_network_hour', 'unsupported', 'transport', 'pagefail', 'server_error']);
     let created = false;
     let lastSignupErr = null;
     let lastClass = null;
