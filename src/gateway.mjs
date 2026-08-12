@@ -69,7 +69,18 @@ export function conversationId(bodyBuf) {
 function classify(status, code, message = '') {
   if (status === 401 || code === 'unauthorized') return 'dead';
   const failureText = `${code || ''} ${message || ''}`;
-  if (code === 'balance_zero' || /insufficient|balance|top up/i.test(failureText)) return 'balance';
+  // Account risk hold. The OpenAI path says confidence_level_required, but the
+  // Anthropic path rewrites the SAME hold to api_error/permission_error — the
+  // message text is the only stable signal across both protocols. (Measured
+  // 2026-08-12: same account, same appeal code, different type per path.)
+  if (code === 'confidence_level_required' || /can't serve our models on this account/i.test(failureText)) return 'flagged';
+  // Empty wallet. OpenAI: 403 balance_zero; Anthropic: 403 authentication_error
+  // — both carry "balance is at $0". The per-call-price rejection ("This model
+  // costs $X per call … top up", insufficient_quota/permission_error) also says
+  // "top up" but the wallet is NOT empty (empty wallets get the $0 text
+  // instead), so it must fall through to soft_402, never retire. Match the
+  // exact $0 phrase only: anything looser books real money away on lookalikes.
+  if (code === 'balance_zero' || /balance is at \$0/i.test(failureText)) return 'balance';
   if (status === 429 || /rate|limit|quota/i.test(failureText)) return 'quota';
   // Pooled accounts do not share one real context window: some backing
   // accounts reject prompts far below the model's advertised size. This is a
@@ -77,26 +88,15 @@ function classify(status, code, message = '') {
   // rotate to another key instead of being handed straight to the client.
   if (status === 400 && /context window|context_length/i.test(failureText)) return 'context_window';
   if (status >= 500 || status === 0) return 'network';
-  // Two 402 codes are known and need their own handling, so they are matched
-  // before the generic soft_402 fallback below.
-  //   confidence_level_required -> account risk hold. The wallet is untouched
-  //     but every paid call is refused ("we can't serve our models on this
-  //     account right now", plus a Discord appeal code), and it does not clear
-  //     on its own within a request. Treating it as soft_402 keeps the key in
-  //     rotation, so every later request pays to rediscover it — 107 rotations
-  //     per 200 log lines when this was ~20% of the pool. 'flagged' parks it
-  //     without pretending the money is gone (see Pool: no ledger write, no
-  //     zeroing, excluded from totalBalance).
   //   insufficient_quota -> daily request quota, comes back on reset, which is
   //     exactly what 'quota' already means.
-  if (code === 'confidence_level_required' || /confidence_level/i.test(failureText)) return 'flagged';
   if (code === 'insufficient_quota') return 'quota';
   // Upstream overloads HTTP 402/403 with unrelated business errors (e.g.
-  // api_error, confidence_level_required, permission_error) that have
-  // nothing to do with the key's actual balance. Only a code/message that
-  // names balance/insufficiency (matched above) proves the key is spent —
-  // any other 402/403 must rotate to the next key WITHOUT retiring this one,
-  // or a transient upstream fault permanently kills a fully-funded key.
+  // api_error, permission_error) that have nothing to do with the key's actual
+  // balance. Only the exact "balance is at $0" phrase or a balance_zero code
+  // (matched above) proves the key is spent — any other 402/403 must rotate
+  // to the next key WITHOUT retiring this one, or a transient upstream fault
+  // permanently kills a fully-funded key.
   if (status === 402 || status === 403) return 'soft_402';
   return 'unknown';
 }

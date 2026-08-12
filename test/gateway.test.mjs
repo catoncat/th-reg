@@ -272,6 +272,112 @@ test('gateway still retires a genuine 402 balance_zero code', async () => {
 });
 
 
+
+test('Anthropic-path risk hold (api_error + hold message) parks the key as flagged', async () => {
+  // Measured 2026-08-12: the SAME risk-held account returns
+  // confidence_level_required on /v1/chat/completions but api_error with the
+  // identical message on /v1/messages. classify must key on the message.
+  const attempts = [];
+  const upstream = createServer(async (req, res) => {
+    const key = req.headers.authorization?.replace('Bearer ', '') || req.headers['x-api-key'];
+    attempts.push(key);
+    res.writeHead(key === 'key-one' ? 402 : 200, { 'content-type': 'application/json' });
+    if (key === 'key-one') {
+      return res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'api_error', message: "We can't serve our models on this account right now. Join https://discord.gg/x and send us this code: TH-XXXX" },
+      }));
+    }
+    res.end(JSON.stringify({ id: 'ok', usage: { input_tokens: 1, output_tokens: 1 } }));
+  });
+  const upstreamOrigin = await listen(upstream);
+  const keyPool = pool(['key-one', 'key-two']);
+  const gateway = createGateway({ pool: keyPool, upstreamBase: `${upstreamOrigin}/v1` });
+  const gatewayOrigin = await listen(gateway);
+  try {
+    const response = await fetch(`${gatewayOrigin}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-fable-5', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(attempts, ['key-one', 'key-two']);
+    assert.equal(keyPool.reports[0].reason, 'flagged');
+  } finally {
+    await close(gateway);
+    await close(upstream);
+  }
+});
+
+test('Anthropic-path per-call-price 402 (permission_error + "top up") rotates WITHOUT retiring', async () => {
+  // "This model costs $0.45 per call … top up" means 0 < balance < price —
+  // the wallet is NOT empty (empty wallets get the "balance is at $0" text).
+  // Retiring on it books real money to $0; measured 2026-08-12: 56 pool keys
+  // were mis-retired this way, sampled ones still held $0.08-$0.32.
+  const attempts = [];
+  const upstream = createServer(async (req, res) => {
+    const key = req.headers.authorization?.replace('Bearer ', '') || req.headers['x-api-key'];
+    attempts.push(key);
+    res.writeHead(key === 'key-one' ? 402 : 200, { 'content-type': 'application/json' });
+    if (key === 'key-one') {
+      return res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'permission_error', message: 'This model costs $0.45 per call via the API. Pick a cheaper model or top up at https://tokenharbor.ai/dashboard.' },
+      }));
+    }
+    res.end(JSON.stringify({ id: 'ok', usage: { input_tokens: 1, output_tokens: 1 } }));
+  });
+  const upstreamOrigin = await listen(upstream);
+  const keyPool = pool(['key-one', 'key-two']);
+  const gateway = createGateway({ pool: keyPool, upstreamBase: `${upstreamOrigin}/v1` });
+  const gatewayOrigin = await listen(gateway);
+  try {
+    const response = await fetch(`${gatewayOrigin}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-fable-5', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(attempts, ['key-one', 'key-two']);
+    assert.equal(keyPool.reports[0].reason, 'soft_402');
+  } finally {
+    await close(gateway);
+    await close(upstream);
+  }
+});
+
+test('Anthropic-path empty wallet (403 authentication_error + "balance is at $0") still retires', async () => {
+  const attempts = [];
+  const upstream = createServer(async (req, res) => {
+    const key = req.headers.authorization?.replace('Bearer ', '') || req.headers['x-api-key'];
+    attempts.push(key);
+    res.writeHead(key === 'key-one' ? 403 : 200, { 'content-type': 'application/json' });
+    if (key === 'key-one') {
+      return res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'authentication_error', message: 'Your Token Harbor balance is at $0. Top up at https://tokenharbor.ai/dashboard to keep using paid models.' },
+      }));
+    }
+    res.end(JSON.stringify({ id: 'ok', usage: { input_tokens: 1, output_tokens: 1 } }));
+  });
+  const upstreamOrigin = await listen(upstream);
+  const keyPool = pool(['key-one', 'key-two']);
+  const gateway = createGateway({ pool: keyPool, upstreamBase: `${upstreamOrigin}/v1` });
+  const gatewayOrigin = await listen(gateway);
+  try {
+    const response = await fetch(`${gatewayOrigin}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-fable-5', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(attempts, ['key-one', 'key-two']);
+    assert.equal(keyPool.reports[0].reason, 'balance');
+  } finally {
+    await close(gateway);
+    await close(upstream);
+  }
+});
 test('gateway rotates on a per-key context-window 400 but preserves other 400s verbatim', async () => {
   const attempts = [];
   const upstream = createServer(async (req, res) => {
