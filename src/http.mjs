@@ -11,6 +11,7 @@ import { randomBytes } from 'node:crypto';
 const execFileAsync = promisify(execFile);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 import { stickyEndpoint, rotateEndpoint } from './config.mjs';
+import { SUPABASE_BASE, SUPABASE_ANON } from './th-api.mjs';
 
 export const SIGNUP_URL = 'https://tokenharbor.ai/login?mode=signup';
 export const HOST = 'https://tokenharbor.ai';
@@ -249,10 +250,6 @@ export async function enableFreeModels({ jar, proxy }) {
     timeout: 20000,
   });
 }
-
-const SUPABASE_BASE = 'https://auth.tokenharbor.ai'; // tokenharbor's Supabase proxy (public anon key)
-const SUPABASE_ANON =
-  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlzYm56bXdqbXRpdWlwZXNnbW1nIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzY3NjU1MzYsImV4cCI6MjA5MjM0MTUzNn0.CodUcchio6jNW_k68vaAb--LshBQXK51tZ6VTxNSz_A';
 
 /** Supabase password grant -> the user object (has email_confirmed_at). */
 export async function supabaseGetUser(email, password) {

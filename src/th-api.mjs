@@ -11,7 +11,10 @@
 //   - tokenharbor.ai/v1    = the OpenAI-compatible chat API (key health probe).
 
 export const SUPABASE_BASE = 'https://auth.tokenharbor.ai';
+// Public Supabase anon key — shipped in tokenharbor's frontend JS, public by
+// design. Override with TH_SUPABASE_ANON_KEY if it ever rotates.
 export const SUPABASE_ANON =
+  process.env.TH_SUPABASE_ANON_KEY ||
   'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlzYm56bXdqbXRpdWlwZXNnbW1nIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzY3NjU1MzYsImV4cCI6MjA5MjM0MTUzNn0.CodUcchio6jNW_k68vaAb--LshBQXK51tZ6VTxNSz_A';
 export const API_BASE = 'https://tokenharbor.ai/v1';
 
