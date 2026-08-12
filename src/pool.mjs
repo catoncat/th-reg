@@ -32,14 +32,6 @@ import { nowIso } from './ledger.mjs';
 const DEFAULT_SECRETS_DIR = join(process.env.HOME || '', '.pi', 'agent', 'secrets');
 
 /** Conversation pins kept in memory. Bounded; oldest pin is dropped first. */
-/**
- * How long a key stays parked after an upstream risk hold (402
- * confidence_level_required) before it is retried. Short enough that a wave of
- * holds clears on its own, long enough that a held key is not re-probed by
- * every request. Override with TH_FLAGGED_COOLDOWN_MS.
- */
-const FLAGGED_COOLDOWN_MS = Number(process.env.TH_FLAGGED_COOLDOWN_MS) || 30 * 60 * 1000;
-
 const MAX_AFFINITY_ENTRIES = 500;
 
 export class Pool {
@@ -244,20 +236,24 @@ export class Pool {
     return [...this.keys.values()].sort((a, b) => a.file.localeCompare(b.file));
   }
 
-  /** Keys currently eligible to serve a request. */
-  activeKeys() {
-    const flaggedFloor = Date.now() - FLAGGED_COOLDOWN_MS;
-    return this.all().filter((r) => {
-      if (r.status === 'ok' || r.status === 'quota') return true;
-      // A risk hold is not a verdict: the same keys that were refused have been
-      // observed serving traffic again ~20min later. So park a flagged key long
-      // enough that the pool stops paying to rediscover it on every request,
-      // then let it back in. If it is still held it gets flagged again, which
-      // makes this a self-tuning backoff rather than a death sentence.
-      if (r.status !== 'flagged') return false;
-      const since = Date.parse(r.flaggedAt || '') || 0;
-      return since > 0 && since < flaggedFloor;
-    });
+  /**
+   * Keys currently eligible to serve a request.
+   *
+   * A flagged key (upstream risk hold, 402 confidence_level_required /
+   * api_error) has its *restricted* models locked permanently (claude, glm,
+   * gpt, gemini, kimi, deepseek-flash…) but can still serve a handful of
+   * *unrestricted* models (deepseek-v4-pro, mimo-v2.5, mimo-v2.5-pro,
+   * qwen3.8-max) — verified 2026-08-12 across flagged keys spanning 1h–2d+.
+   * So flagged keys are only excluded for restricted-model requests.
+   */
+  activeKeys(modelTier = 'restricted') {
+    const ok = (r) => r.status === 'ok' || r.status === 'quota';
+    if (modelTier === 'unrestricted') {
+      // flagged keys can still serve cheap/unrestricted models
+      return this.all().filter((r) => ok(r) || r.status === 'flagged');
+    }
+    // restricted-model request: flagged keys are excluded
+    return this.all().filter(ok);
   }
 
   /** Keys held back by an upstream risk hold — money intact, cannot be spent. */
@@ -384,10 +380,12 @@ export class Pool {
   /**
    * Borrow the next active key (round-robin). Returns the record or null when
    * the pool is exhausted. `exclude` lets the gateway skip keys already tried
-   * within the current request.
+   * within the current request. `modelTier` selects which keys are eligible:
+   * 'restricted' excludes flagged keys (claude/glm/gpt/…), 'unrestricted'
+   * includes them (deepseek-pro/mimo/qwen still work on flagged accounts).
    */
-  borrowKey(exclude = new Set(), affinityKey = null) {
-    const active = this.activeKeys().filter((r) => !exclude.has(r.key));
+  borrowKey(exclude = new Set(), affinityKey = null, modelTier = 'restricted') {
+    const active = this.activeKeys(modelTier).filter((r) => !exclude.has(r.key));
     if (active.length === 0) return null;
 
     let keepPin = false;

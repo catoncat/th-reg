@@ -37,6 +37,37 @@ const TIMEOUT = 120000; // upstream LLM calls can be slow
 const MAX_KEY_ATTEMPTS = 8; // give up after trying this many distinct keys
 
 /**
+ * A flagged account (upstream risk hold) has most models locked but can still
+ * serve a few cheap ones. Only requests for these *unrestricted* models may
+ * borrow flagged keys; everything else (claude, glm, gpt, gemini, kimi,
+ * deepseek-flash, …) must use an unflagged key. Verified 2026-08-12 across
+ * flagged keys spanning 1h–2d+: the hold is permanent per-account, not a
+ * cooldown, but only applies to a subset of models.
+ *
+ * Why this is account-level, NOT IP-level (so a residential proxy does NOT help):
+ *   - The same flagged key returns the SAME appeal code (TH-XXXXXXXX) whether
+ *     called direct, via rotate proxy, or via sticky proxy → the hold is bound
+ *     to the account, not the egress IP.
+ *   - Email-domain distribution of flagged vs ok keys is uniform → not a domain
+ *     reputation gate either.
+ *   - Therefore: do NOT add a proxy to the gateway to "spread out risk control".
+ *     It burns residential bandwidth (per-GB) and adds latency for zero effect.
+ *   - Residential proxy is only worth it for IP-level limits (registration
+ *     "too many sign-ups from this network", Vercel checkpoint on verify,
+ *     upstream-fault diagnosis). Those are already handled in the register path.
+ */
+const UNRESTRICTED_MODELS = new Set([
+  'deepseek-v4-pro',
+  'mimo-v2.5',
+  'mimo-v2.5-pro',
+  'qwen3.8-max',
+]);
+
+function modelTier(model) {
+  return model && UNRESTRICTED_MODELS.has(model) ? 'unrestricted' : 'restricted';
+}
+
+/**
  * Identify the conversation a request belongs to, so the pool can keep serving
  * it from one key and keep the upstream prompt cache warm.
  *
@@ -330,8 +361,18 @@ export function createGateway({
 
     // Only the first attempt honours affinity: once a key has failed for this
     // request, retries must be free to land anywhere.
+    //
+    // Flagged-storm guard: when upstream is mass-holding accounts (402
+    // confidence_level_required / api_error on Anthropic), every attempt burns
+    // a fresh ok key into flagged for nothing. Stop early after N consecutive
+    // flagged holds so a single request cannot burn the whole pool. Other
+    // retryable reasons (network/soft_402/quota) reset the streak — they are
+    // not evidence of a risk-hold storm.
+    const flaggedStreakLimit = 2;
+    let flaggedStreak = 0;
+    const tier = modelTier(model);
     for (let attempt = 0; attempt < maxKeyAttempts; attempt++) {
-      const rec = pool.borrowKey(tried, attempt === 0 && !metering ? convo : null);
+      const rec = pool.borrowKey(tried, attempt === 0 && !metering ? convo : null, tier);
       if (!rec) {
         log(`pool exhausted after ${tried.size} Anthropic key attempt(s)`);
         try {
@@ -411,12 +452,22 @@ export function createGateway({
       pool.report(rec.key, { ok: false, reason, error: code || `http ${status}` });
       lastHard = { status, code, reason };
       log(`${rec.file} Anthropic -> ${status} ${code} (${reason}); rotating`);
+      if (reason === 'flagged') {
+        flaggedStreak++;
+        if (flaggedStreak >= flaggedStreakLimit) {
+          log(`Anthropic flagged-storm: ${flaggedStreak} consecutive holds, stopping early to preserve ok keys`);
+          break;
+        }
+      } else {
+        flaggedStreak = 0;
+      }
     }
 
     sendJson(res, 503, {
       error: {
-        message: `tokenharbor upstream failed after ${maxKeyAttempts} key attempts. Last: ${lastHard?.status} ${lastHard?.code}`,
+        message: `tokenharbor upstream failed after ${tried.size} key attempt(s)${flaggedStreak >= flaggedStreakLimit ? " (flagged-storm early stop)" : ""}. Last: ${lastHard?.status} ${lastHard?.code}`,
         type: lastHard?.reason || 'upstream_error',
+        code: lastHard?.code || 'upstream_error',
       },
     });
   }
@@ -497,8 +548,12 @@ export function createGateway({
     }
 
     // See handleMessages: affinity applies to the first attempt only.
+    // Flagged-storm guard (see handleMessages for rationale).
+    const flaggedStreakLimit = 2;
+    let flaggedStreak = 0;
+    const tier = modelTier(model);
     for (let attempt = 0; attempt < maxKeyAttempts; attempt++) {
-      const rec = pool.borrowKey(tried, attempt === 0 ? convo : null);
+      const rec = pool.borrowKey(tried, attempt === 0 ? convo : null, tier);
       if (!rec) {
         log(`pool exhausted after ${tried.size} key attempt(s)`);
         try {
@@ -574,13 +629,22 @@ export function createGateway({
       pool.report(rec.key, { ok: false, reason, error: code || `http ${status}` });
       lastHard = { status, code, reason, file: rec.file };
       log(`${rec.file} -> ${status} ${code} (${reason}); rotating`);
+      if (reason === 'flagged') {
+        flaggedStreak++;
+        if (flaggedStreak >= flaggedStreakLimit) {
+          log(`flagged-storm: ${flaggedStreak} consecutive holds, stopping early to preserve ok keys`);
+          break;
+        }
+      } else {
+        flaggedStreak = 0;
+      }
       // loop continues with a different key
     }
 
-    // ran out of attempts
+    // ran out of attempts (or flagged-storm early stop)
     sendJson(res, 503, {
       error: {
-        message: `tokenharbor upstream failed after ${maxKeyAttempts} key attempts. Last: ${lastHard?.status} ${lastHard?.code}`,
+        message: `tokenharbor upstream failed after ${tried.size} key attempt(s)${flaggedStreak >= flaggedStreakLimit ? " (flagged-storm early stop)" : ""}. Last: ${lastHard?.status} ${lastHard?.code}`,
         type: lastHard?.reason || 'upstream_error',
         code: lastHard?.code || 'upstream_error',
       },
