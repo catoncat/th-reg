@@ -29,6 +29,14 @@ model=claude-opus-5, thinking={type:"adaptive",display:"summarized"}, output_con
 
 注意:这三条**都不是** TokenHarbor 路径。旧结论针对的是 `tokenharbor-openai`,而该 provider 已按旧(不可靠的)结论从 `~/.pi/agent/models.json` 删除。**要判定 TH 走 GPT 到底行不行,需要把该 provider 临时加回、用硬题重测**,目前没有可信数据。
 
+**TH 路径可信数据(2026-08-13,硬题 5 人排队约束)**:TH 上游对 gpt-5.6-sol/luna/terra 三协议全无思考输出——
+OpenAI chat(含 reasoning_effort=high)无 reasoning_content、usage 无 reasoning_tokens;OpenAI responses 的
+output 只有 message 类型、无 reasoning item;/v1/messages(Anthropic)带 thinking(enabled/adaptive)只回 text block。
+对照组:同题同参数,TH 的 deepseek-v4-flash OpenAI 路径返回 reasoning_content;同一 openai/gpt-5.6-sol 在
+ai-rs(apiproxy.fly.dev)responses 路径返回 output=[reasoning,message](encrypted_content)。**结论:TH 后端对
+GPT 系剥离/不产生 reasoning 通道,思考过程只会出现在 content 正文里;要 GPT 的独立思考值请走 ai-rs 等有
+reasoning 的 provider,TH 上做不到(非配置问题,models.json 已把 gpt-5.6-* reasoning 标 false)。**
+
 ## 3. 「开启 thinking 会导致增量 prompt cache 不写入」—— 错
 
 **旧说法**:严格对照显示 thinking 开 → `cache_creation=0`、新增尾部每轮全价重付;thinking 关 → 正常写缓存。据此曾判定这是真实会话 48 轮 write=0 的根因。
