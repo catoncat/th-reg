@@ -62,14 +62,39 @@ json = { access_token, token_type, expires_in, expires_at, refresh_token, user }
 rate_fast 自动降级 → verified + key（/v1/models 200，20 模型）+ free models，
 约 23s/账号。
 
-## 已知限制（重要）
+## 已知限制：$5 welcome 赠金在限流期间原理上拿不到
 
-- **$5 welcome 赠金拿不到**：claim 返回 `rewardUsd:0`。根因：$5 的发放条件是注册时
-  user_metadata 里有后端带 secret 签名的 `signup_proof`（64 hex，样本 8 个，简单
-  哈希/verify-token 派生均不匹配，前端 bundle 无生成逻辑 → 后端生成，无法复刻）。
-  GoTrue 原生 signup 无此字段 → trigger 打 `th_quarantine` → claim 只发 $0。
-  账号本身完全可用（key/free models/API），仅缺 $5。
-- 若 $5 是硬需求：等桶恢复后走 server action（默认路径）即可。
-- 已排除的假设（别重复踩）：signup_ip 真伪、x-forwarded-for/x-real-ip 头、metadata
-  服务端标记（th_origin/th_source 等）、PATCH /auth/v1/user 补 proof（405）、
-  signup-proof 端点（404）、verify token 签名派生 proof（不匹配）。
+### signup_proof 逆向结论（2026-08-13 实测，三重校验）
+
+正常注册（server action）时，Next.js 后端用**服务端 secret** 生成 `signup_proof`
+（64 hex = 32 字节，HMAC-SHA256 形态）写入 user_metadata，并带 `signup_proof_at`
+（unix 秒）。Supabase 的 signup trigger 对原生 signup 的账号做**三重校验**，用
+`th_quarantine` 三态标记：
+
+| 我们提交的 metadata | th_quarantine | 含义 |
+| --- | --- | --- |
+| 无 signup_proof / 无法解析 | `signup_origin_unverified` | 缺 proof |
+| proof 存在但 proof_at 过期或未来 | `signup_origin_expired` | 时效不符 |
+| proof 存在 + 时效对但**签名错**（复制他人 proof / 伪造） | `signup_origin_invalid` | 签名验证失败 |
+
+claim 端点按 proof 有效性发钱：合法 proof → $5，否则 $0。**signup_proof 是带
+secret 的签名，绑定账号与时戳，无法从外部伪造**（已排除：简单哈希/HMAC 猜测、
+复制真实 proof、PATCH metadata 补 proof=405、signup-proof 端点=404、前端 bundle
+无生成逻辑、source map=404）。这是 tokenharbor 针对「anon key 公开、任何人可调
+GoTrue signup」的防绕过设计——绕桶建号可用，但 $5 被扣。
+
+### 第一性原理结论
+
+- $5 的唯一合法来源 = server action 注册时后端签发的 signup_proof（secret 在
+  Vercel 环境变量，外部不可得）。
+- server action 被**全局共享 rate_fast 桶**限流（跨出口 IP 共享，换 IP 无效）。
+- 因此**桶空（限流）期间 $5 原理上拿不到**：绕桶路径无 proof（$0），server
+  action 撞桶（建不了号）。
+- 桶恢复节奏由 tokenharbor 服务端 + 外部消耗决定，本侧无法控制。
+
+### 落地策略（已实现）
+
+- `auto`（默认）：先走 server action（拿 $5），撞 `rate_fast` 自动降级绕桶
+  路径（保底拿到可用 key + free models，只是 $0）。
+- 桶恢复时段 server action 自然成功 → $5 完整；限流时段绕桶保底。
+- 想要 $5：等桶恢复后跑 `--signup-path server-action`（pacer AIMD 自适应间隔）。

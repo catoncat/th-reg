@@ -97,6 +97,7 @@ async function main() {
     ...(o.workers !== undefined ? { workers: o.workers } : {}),
     ...(o.inviteCode !== undefined ? { inviteCode: o.inviteCode } : {}),
     ...(o.proxyMode !== undefined ? { proxyMode: o.proxyMode } : {}),
+    ...(o.signupPath !== undefined ? { signupPath: o.signupPath } : {}),
   });
 
   const engine = await loadEngine(o.engine);
