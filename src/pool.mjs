@@ -34,6 +34,23 @@ const DEFAULT_SECRETS_DIR = join(process.env.HOME || '', '.pi', 'agent', 'secret
 /** Conversation pins kept in memory. Bounded; oldest pin is dropped first. */
 const MAX_AFFINITY_ENTRIES = 500;
 
+/**
+ * Backoff for keys parked in status='quota'. Upstream 'insufficient_quota'
+ * conflates two unrelated faults under one code: a resettable daily-request
+ * limit (recovers on its own) and a wallet too small for the requested model's
+ * per-call price (never recovers without a top-up). failCount is the only
+ * signal that separates them — report() zeroes it on any 200, so a genuinely
+ * recoverable key clears itself, while a stuck one just climbs (measured
+ * 2026-08-13: one quota key reached failCount 170, re-borrowed and re-failed
+ * ~11x in 18min). Rather than exclude quota keys outright (a fresh quota hit
+ * may still recover) or gate on a balance floor (a $0.85 key was still stuck),
+ * back a quota key off for base·2^(failCount-1), capped, measured from its last
+ * attempt. Fresh hits retry in seconds; chronic stallers retry every ~30min, so
+ * a later top-up still revives them at ~1/100th the wasted attempts.
+ */
+const QUOTA_BACKOFF_BASE_MS = Number(process.env.TH_QUOTA_BACKOFF_BASE_MS) || 30_000;
+const QUOTA_BACKOFF_MAX_MS = Number(process.env.TH_QUOTA_BACKOFF_MAX_MS) || 30 * 60_000;
+
 export class Pool {
   /**
    * @param {object} opts
@@ -247,7 +264,7 @@ export class Pool {
    * So flagged keys are only excluded for restricted-model requests.
    */
   activeKeys(modelTier = 'restricted') {
-    const ok = (r) => r.status === 'ok' || r.status === 'quota';
+    const ok = (r) => (r.status === 'ok' || r.status === 'quota') && this._quotaReady(r);
     if (modelTier === 'unrestricted') {
       // flagged keys can still serve cheap/unrestricted models
       return this.all().filter((r) => ok(r) || r.status === 'flagged');
@@ -259,6 +276,16 @@ export class Pool {
   /** Keys held back by an upstream risk hold — money intact, cannot be spent. */
   flaggedKeys() {
     return this.all().filter((r) => r.status === 'flagged');
+  }
+
+  /** See QUOTA_BACKOFF_BASE_MS. A quota key is eligible again once its
+   * exponential backoff window has elapsed since its last attempt. */
+  _quotaReady(r) {
+    if (r.status !== 'quota') return true;
+    const n = Math.max(1, r.failCount || 1);
+    const waitMs = Math.min(QUOTA_BACKOFF_MAX_MS, QUOTA_BACKOFF_BASE_MS * 2 ** (n - 1));
+    const last = r.lastUsed ? Date.parse(r.lastUsed) : 0;
+    return !last || Date.now() - last >= waitMs;
   }
 
   activeCount() {
@@ -288,6 +315,7 @@ export class Pool {
     let deadKeys = 0;
     let quotaKeys = 0;
     let flaggedKeys = 0;
+    let quotaBackoffKeys = 0;
     const keys = [];
 
     let currentKey = '';
@@ -303,13 +331,18 @@ export class Pool {
     let current = null;
     for (const r of this.all()) {
       const retired = r.status === 'exhausted' || r.status === 'dead';
+      // A quota key waiting out its backoff (see QUOTA_BACKOFF_BASE_MS) is not
+      // yet retryable. Counting it as active overstates capacity and makes
+      // supply believe there is head-room no request can actually use right now.
+      const backingOff = r.status === 'quota' && !this._quotaReady(r);
       if (r.used || retired) usedKeys++;
+      if (backingOff) quotaBackoffKeys++;
       if (r.status === 'dead') deadKeys++;
       else if (r.status === 'exhausted') exhaustedKeys++;
       else if (r.status === 'flagged') flaggedKeys++;
       else if (r.status === 'quota') {
         quotaKeys++;
-        activeKeys++;
+        if (!backingOff) activeKeys++;
       } else if (r.status === 'ok') {
         activeKeys++;
       }
@@ -345,6 +378,7 @@ export class Pool {
         status: r.status,
         balance,
         balanceKnown,
+        backingOff,
         used: !!(r.used || retired),
         email: r.email,
         lastError: r.lastError,
@@ -364,6 +398,7 @@ export class Pool {
       deadKeys,
       quotaKeys,
       flaggedKeys,
+      quotaBackoffKeys,
       totalKeys: keys.length,
       totalBalance: Math.round(totalBalance * 100) / 100,
       knownBalanceKeys,
@@ -482,7 +517,12 @@ export class Pool {
         });
       } else if (outcome.reason === 'quota') {
         rec.status = 'quota';
-        // quota is not a balance fact — leave balance alone, no ledger write
+        // quota is not a balance fact — leave balance alone, no ledger write.
+        // Stamp the attempt time so _quotaReady measures backoff from this
+        // failure rather than from whenever the key was last borrowed: the two
+        // coincide in the serving path, but only this makes the window a
+        // property of the failure itself.
+        rec.lastUsed = at;
       } else if (outcome.reason === 'flagged') {
         rec.flaggedAt = at;
         // Account risk hold (402 confidence_level_required). The money is still
