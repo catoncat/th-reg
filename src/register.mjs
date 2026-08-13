@@ -52,6 +52,8 @@ import {
   createApiKey,
   enableFreeModels,
   fetchWallet,
+  supabaseSignup,
+  buildSessionCookie,
   SIGNUP_URL,
   HOST,
 } from './http.mjs';
@@ -98,8 +100,38 @@ export async function registerOne(cfg, { email, password, log = () => {}, pacer 
     let created = false;
     let lastSignupErr = null;
     let lastClass = null;
+    let sbSession = null; // supabase-native session (rate-limit bypass path)
 
-    for (let attempt = 1; attempt <= MAX_SIGNUP_ATTEMPTS; attempt++) {
+    // Helper: create the account via GoTrue /auth/v1/signup. This endpoint
+    // does NOT pass through the shared cross-IP submission bucket, so it works
+    // while the server-action signup is being rate-limited ("rate_fast").
+    // Measured limitation: no server-side signup_proof => welcome grant is $0.
+    const supabaseAttempt = async () => {
+      const fp = randomUUID();
+      result.device_fingerprint = fp;
+      const sb = await supabaseSignup({
+        email, password, fp, timezone: cfg.timezone,
+        signupIp: result.egress_ip || undefined, inviteCode: cfg.inviteCode,
+      });
+      if (sb.error) {
+        lastSignupErr = 'supabase-signup: ' + sb.error;
+        lastClass = 'supabase';
+        log('[!] ' + lastSignupErr);
+        return false;
+      }
+      sbSession = sb;
+      result.status = 'created';
+      result.sess_id = sb.user.id; // real uid is more useful than a fake sess id
+      created = true;
+      log('[+] account created via supabase-native signup (rate-limit bypass)');
+      return true;
+    };
+
+    if (cfg.signupPath === 'supabase') {
+      // Explicit bypass path: no shared bucket, no pacer slot needed.
+      await supabaseAttempt();
+    } else {
+      for (let attempt = 1; attempt <= MAX_SIGNUP_ATTEMPTS; attempt++) {
       lastClass = null;
       try {
         // Serialize the submit step across workers (shared server-side bucket).
@@ -166,6 +198,14 @@ export async function registerOne(cfg, { email, password, log = () => {}, pacer 
       rotateSession();
       await sleep(400);
     }
+      }
+
+    // rate_fast (shared cross-IP bucket empty) → fall back to the bypass path
+    // so a batch keeps moving instead of stalling on the shared bucket.
+    if (!created && cfg.signupPath !== 'server-action' && lastClass === 'rate_fast') {
+      log('[·] rate_fast — falling back to supabase-native signup (bypass)');
+      await supabaseAttempt();
+    }
 
     if (!created) {
       result.status = 'failed';
@@ -173,6 +213,17 @@ export async function registerOne(cfg, { email, password, log = () => {}, pacer 
       if (lastClass) result.reject_class = lastClass;
       return result;
     }
+
+    // supabase-native sessions authenticate the business /api/* endpoints via
+    // the GoTrue chunked cookie pair (Bearer is rejected: "Sign in first.").
+    const sbCookie = sbSession
+      ? buildSessionCookie({
+          access_token: sbSession.accessToken,
+          expires_at: sbSession.expiresAt,
+          refresh_token: sbSession.refreshToken,
+          user: sbSession.user,
+        })
+      : null;
 
     // 4. verify the email for real. This is mandatory: without opening the
     //    mailbox link the API answers 403 email_not_verified, so an account
@@ -190,7 +241,7 @@ export async function registerOne(cfg, { email, password, log = () => {}, pacer 
     // A dead proxy tunnel here used to throw away a perfectly good account, so
     // this is retried and, if it still fails, we fall through to the mailbox
     // poll anyway (the mail may already be on its way).
-    const sent = await withRetry(() => sendVerificationEmail({ jar, proxy }), 2, (m) =>
+    const sent = await withRetry(() => sendVerificationEmail({ jar, proxy, cookie: sbCookie }), 2, (m) =>
       log(`[!] send-verification-email retry: ${m}`),
     );
     log(sent ? `[·] verification email requested (http ${sent.code})` : '[!] send-verification-email failed; polling the mailbox anyway');
@@ -213,7 +264,7 @@ export async function registerOne(cfg, { email, password, log = () => {}, pacer 
     }
 
     result.verify_link = link;
-    const v = await openVerify(link, { jar, proxy });
+    const v = await openVerify(link, { jar, cookie: sbCookie, proxy });
     if (!v.location?.includes('verify=success')) {
       result.status = 'created-unverified';
       result.note = `verify link did not confirm (${v.location || 'http ' + v.code})`;
@@ -226,7 +277,7 @@ export async function registerOne(cfg, { email, password, log = () => {}, pacer 
     // 5. claim the $5 grant + create the API key, then prove both landed.
     //    Best-effort: failures are recorded but do not undo the account.
     try {
-      await postRegisterSetupHTTP(cfg, { jar, proxy, result, password, log });
+      await postRegisterSetupHTTP(cfg, { jar, cookie: sbCookie, proxy, result, password, log });
     } catch (err) {
       result.note = [result.note, `post-register: ${err.message}`].filter(Boolean).join(' | ');
       log(`[!] post-register partial: ${err.message}`);
@@ -242,11 +293,11 @@ export async function registerOne(cfg, { email, password, log = () => {}, pacer 
  * Claim the welcome grant, create an API key, then confirm the balance from
  * Supabase `wallets` — the authoritative source. Never infer money from HTML.
  */
-export async function postRegisterSetupHTTP(cfg, { jar, proxy, result, password, log }) {
+export async function postRegisterSetupHTTP(cfg, { jar, cookie, proxy, result, password, log }) {
   // After verify, claim / API key / free-models only need the session cookie.
   // Run them concurrently (async curl). free-models is best-effort and must
   // not block a funded paid-route account (opus etc. do not need it).
-  const claimP = withRetry(() => claimWelcomeGrant({ jar, proxy }), 2)
+  const claimP = withRetry(() => claimWelcomeGrant({ jar, cookie, proxy }), 2)
     .then((cr) => {
       if (!cr) return { cr: { code: 0 }, claimed: null, error: 'transport' };
       let claimed = null;
@@ -259,7 +310,7 @@ export async function postRegisterSetupHTTP(cfg, { jar, proxy, result, password,
     })
     .catch((e) => ({ cr: { code: 0 }, claimed: null, error: e.message }));
 
-  const keyP = withRetry(() => createApiKey({ label: 'bot-key', jar, proxy }), 2)
+  const keyP = withRetry(() => createApiKey({ label: 'bot-key', jar, cookie, proxy }), 2)
     .then((kr) => {
       if (!kr) return { kr: { code: 0 }, plaintext: null, error: 'transport' };
       let plaintext = null;
@@ -275,7 +326,7 @@ export async function postRegisterSetupHTTP(cfg, { jar, proxy, result, password,
     })
     .catch((e) => ({ kr: { code: 0 }, plaintext: null, error: e.message }));
 
-  const freeP = enableFreeModels({ jar, proxy })
+  const freeP = enableFreeModels({ jar, cookie, proxy })
     .then((fr) => {
       try {
         return JSON.parse(fr.body)?.free_models_enabled === true;
@@ -302,9 +353,16 @@ export async function postRegisterSetupHTTP(cfg, { jar, proxy, result, password,
     result.balance_trial = Number.isFinite(trial) ? trial : Number(claimRes.claimed.rewardUsd) || 5;
     result.balance_paid = 0;
     result.gift_claimed = result.balance_trial >= 4.99;
-    log(
-      `[+] welcome grant claimed: $${claimRes.claimed.rewardUsd ?? 5} (trial=$${result.balance_trial})`,
-    );
+    if (cookie && result.balance_trial < 4.99) {
+      // supabase-native signup lacks the server-side signup_proof, so the
+      // welcome grant is issued at $0 (measured 2026-08-13; see http.mjs).
+      result.note = [result.note, 'welcome grant $0 (supabase-native signup: no signup_proof; known limitation)'].filter(Boolean).join(' | ');
+      log('[!] welcome grant $0 — supabase-native signup has no signup_proof (known limitation)');
+    } else {
+      log(
+        `[+] welcome grant claimed: ${claimRes.claimed.rewardUsd ?? 5} (trial=${result.balance_trial})`,
+      );
+    }
   } else {
     const why = claimRes.claimed?.error?.code || claimRes.error || `http ${claimRes.cr?.code}`;
     result.note = [result.note, `welcome claim failed: ${why}`].filter(Boolean).join(' | ');

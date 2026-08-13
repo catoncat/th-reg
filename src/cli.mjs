@@ -49,6 +49,7 @@ function parseArgs(argv) {
     else if (a === '--workers') o.workers = Number(next());
     else if (a === '--invite-code') o.inviteCode = next();
     else if (a === '--proxy') o.proxyMode = next();
+    else if (a === '--signup-path') o.signupPath = next();
     else if (a === '--engine') o.engine = next();
     else if (a === '--help') {
       console.log(`usage: node src/cli.mjs [options]
@@ -60,6 +61,9 @@ function parseArgs(argv) {
   --delay-ms MS                   pause between accounts
   --invite-code CODE              referral code
   --proxy direct|sticky|rotate    network mode (default direct)
+--signup-path auto|server-action|supabase
+                              signup path; supabase bypasses the rate bucket
+                              but pays no $5 welcome grant (default auto)
   --engine protocol|browser       registration engine (default protocol)
 
 Engines are independent paths; 'protocol' never falls back to 'browser'.

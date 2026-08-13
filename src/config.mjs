@@ -90,6 +90,11 @@ export function loadConfig(overrides = {}) {
     supplyLowWatermark: Number(env.TH_SUPPLY_LOW_WATERMARK || 1.0),
     // Concurrent register workers inside one supply run (claim∥key already parallel per account).
     supplyWorkers: Number(env.TH_SUPPLY_WORKERS || 3),
+    // signup path: 'server-action' (default app flow, has $5 welcome grant but
+    // shares the cross-IP submission bucket) | 'supabase' (GoTrue-native,
+    // bypasses the bucket — no $5 grant) | 'auto' (server-action first, falls
+    // back to supabase on rate_fast).
+    signupPath: env.TH_SIGNUP_PATH || 'auto',
     // Signup submit pacing (see src/pacer.mjs). The endpoint rate-limits across
     // exit IPs, so the submit step is serialized and its gap adapts AIMD-style.
     signupMinGapMs: Number(env.TH_SIGNUP_MIN_GAP_MS || 4000),

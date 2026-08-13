@@ -26,14 +26,16 @@ export function resolveProxy(cfg, sessId) {
 }
 
 /** Run curl with a cookie jar; return { code, location, cookies, body }. */
-export async function httpRequest({ method = 'GET', url, data, contentType, jar, proxy, timeout = 30000 }) {
+export async function httpRequest({ method = 'GET', url, data, contentType, jar, cookie, extraHeaders, proxy, timeout = 30000 }) {
   let lastErr;
   for (let attempt = 0; attempt < 3; attempt++) {
     const args = ['-sS', '-m', String(timeout), '-A', UA];
     if (proxy) args.push('-x', proxy);
     if (jar) args.push('-b', jar, '-c', jar);
+    if (cookie) args.push('-b', cookie);
     if (data != null) args.push('--data-binary', data);
     if (contentType) args.push('-H', 'content-type: ' + contentType);
+    if (extraHeaders) for (const [k, v] of Object.entries(extraHeaders)) args.push('-H', `${k}: ${v}`);
     const hdrFile = '/tmp/thh-' + process.pid + '-' + randomBytes(4).toString('hex') + '.hdr';
     const bodyFile = '/tmp/thh-' + process.pid + '-' + randomBytes(4).toString('hex') + '.body';
     args.push('-D', hdrFile, '-o', bodyFile, '-w', '%{http_code}', '-X', method, url);
@@ -182,8 +184,8 @@ export async function fetchEgressIp({ proxy }) {
 }
 
 /** Open a verify link; returns redirect URL (expect /dashboard?verify=success). */
-export async function openVerify(link, { jar, proxy }) {
-  return httpRequest({ method: 'GET', url: link, jar, proxy, timeout: 20000 });
+export async function openVerify(link, { jar, cookie, proxy }) {
+  return httpRequest({ method: 'GET', url: link, jar, cookie, proxy, timeout: 20000 });
 }
 
 /**
@@ -192,11 +194,12 @@ export async function openVerify(link, { jar, proxy }) {
  * Registration does not reliably send the mail on its own, so the pure-protocol
  * path triggers it explicitly.
  */
-export async function sendVerificationEmail({ jar, proxy }) {
+export async function sendVerificationEmail({ jar, cookie, proxy }) {
   return httpRequest({
     method: 'POST',
     url: `${HOST}/api/me/send-verification-email`,
     jar,
+    cookie,
     proxy,
     timeout: 20000,
   });
@@ -206,8 +209,8 @@ export async function sendVerificationEmail({ jar, proxy }) {
  * List claimable rewards -> { claimable: [{ kind, level, reward }] }.
  * `welcome_grant` is the $5 signup credit.
  */
-export async function giftsStatus({ jar, proxy }) {
-  return httpRequest({ method: 'GET', url: `${HOST}/api/gifts/status`, jar, proxy, timeout: 20000 });
+export async function giftsStatus({ jar, cookie, proxy }) {
+  return httpRequest({ method: 'GET', url: `${HOST}/api/gifts/status`, jar, cookie, proxy, timeout: 20000 });
 }
 
 /**
@@ -215,18 +218,19 @@ export async function giftsStatus({ jar, proxy }) {
  * 200 -> { ok: true, rewardUsd: 5, newTrialBalance: 5 }
  * 403 `email_not_verified` -> the mailbox link must be opened first.
  */
-export async function claimWelcomeGrant({ jar, proxy }) {
-  return httpRequest({ method: 'POST', url: `${HOST}/api/welcome/claim`, jar, proxy, timeout: 25000 });
+export async function claimWelcomeGrant({ jar, cookie, proxy }) {
+  return httpRequest({ method: 'POST', url: `${HOST}/api/welcome/claim`, jar, cookie, proxy, timeout: 25000 });
 }
 
 /** POST /api/keys; returns parsed JSON (contains `plaintext` full key). */
-export async function createApiKey({ label, jar, proxy }) {
+export async function createApiKey({ label, jar, cookie, proxy }) {
   return httpRequest({
     method: 'POST',
     url: 'https://tokenharbor.ai/api/keys',
     data: JSON.stringify({ label }),
     contentType: 'application/json',
     jar,
+    cookie,
     proxy,
     timeout: 20000,
   });
@@ -239,13 +243,14 @@ export async function createApiKey({ label, jar, proxy }) {
  * the consent dialog does POST /api/me/privacy { free_models_enabled: true }.
  * Idempotent — safe to call on an account that already opted in.
  */
-export async function enableFreeModels({ jar, proxy }) {
+export async function enableFreeModels({ jar, cookie, proxy }) {
   return httpRequest({
     method: 'POST',
     url: `${HOST}/api/me/privacy`,
     data: JSON.stringify({ free_models_enabled: true }),
     contentType: 'application/json',
     jar,
+    cookie,
     proxy,
     timeout: 20000,
   });
@@ -303,4 +308,89 @@ export async function fetchWallet(email, password) {
   } catch {
     return null;
   }
+}
+
+/**
+ * Supabase GoTrue native signup — the RATE-LIMIT BYPASS path (2026-08-13).
+ *
+ * tokenharbor's app-layer signup server action sits behind a shared cross-IP
+ * submission bucket ("You're doing that a bit fast"), measured to ignore exit
+ * IP. The raw GoTrue endpoint /auth/v1/signup does NOT pass through that
+ * bucket, so accounts can still be created while the bucket is empty.
+ *
+ * Measured requirements:
+ *   * data.signup_ip MUST be present (any value; the Supabase trigger
+ *     errors signup_trigger_error:signup_ip_required without it).
+ *   * The created user carries th_quarantine: signup_origin_unverified in
+ *     user_metadata (the server-action path instead embeds a secret-signed
+ *     signup_proof). Consequence: /api/welcome/claim pays rewardUsd=0 —
+ *     the $5 welcome grant is NOT obtainable on this path (measured). The
+ *     account itself is fully usable: auto-created Universal Key, verification
+ *     email, verify link, and free-models consent all work.
+ *   * Supabase auto-confirms the email (email_confirmed_at set at signup), but
+ *     the business API still answers 403 email_not_verified until the mailbox
+ *     verify link is opened — the standard flow below still applies.
+ */
+export async function supabaseSignup({ email, password, fp, timezone = 'Asia/Shanghai', signupIp, inviteCode }) {
+  const body = {
+    email,
+    password,
+    data: {
+      device_fingerprint: fp,
+      timezone,
+      signup_ip: signupIp || '0.0.0.0',
+    },
+  };
+  if (inviteCode) body.data.invite_code = inviteCode;
+  const res = await httpRequest({
+    method: 'POST',
+    url: `${SUPABASE_BASE}/auth/v1/signup`,
+    data: JSON.stringify(body),
+    contentType: 'application/json',
+    extraHeaders: { apikey: SUPABASE_ANON },
+    timeout: 30000,
+  });
+  let parsed = null;
+  try {
+    parsed = JSON.parse(res.body);
+  } catch {
+    return { error: `signup http ${res.code} (non-JSON)` };
+  }
+  if (res.code !== 200 || !parsed?.user) {
+    return { error: parsed?.error?.message || `signup http ${res.code}` };
+  }
+  return {
+    user: parsed.user,
+    accessToken: parsed.access_token,
+    refreshToken: parsed.refresh_token,
+    expiresAt: parsed.expires_at,
+  };
+}
+
+/**
+ * Build the business-side session cookie from a Supabase session.
+ *
+ * tokenharbor's /api/* endpoints authenticate via the GoTrue chunked cookie
+ * pair sb-auth-auth-token.0 / .1 (NOT a Bearer header — measured: Bearer is
+ * answered 401 "Sign in first."). Format measured 2026-08-13:
+ *
+ *   .0 = "base64-" + base64url(json).slice(0, cut)
+ *   .1 = base64url(json).slice(cut)
+ *   json = { access_token, token_type, expires_in, expires_at, refresh_token, user }
+ *
+ * The cut point is irrelevant to the server (it concatenates the chunks);
+ * th_sid and other cookies are not required.
+ */
+export function buildSessionCookie(session) {
+  const payload = {
+    access_token: session.access_token,
+    token_type: session.token_type || 'bearer',
+    expires_in: session.expires_in || 3600,
+    expires_at: session.expires_at,
+    refresh_token: session.refresh_token,
+    user: session.user,
+  };
+  const b64 = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const cut = Math.floor(b64.length * 0.75);
+  return `sb-auth-auth-token.0=base64-${b64.slice(0, cut)}; sb-auth-auth-token.1=${b64.slice(cut)}`;
 }
