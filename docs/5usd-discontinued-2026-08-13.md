@@ -38,3 +38,25 @@ grant 是 `amount_usd: 0`，/api/welcome/claim 返回 `nothing_pending`（已按
 
 （附：$5 历史账号是 7 天 trial，08-06 的 $5 今天已到期被 reclaimed，accounts.jsonl 里
 balance>0 的只剩 13 个。）
+
+
+---
+
+## 追加实测（claim 亲自走一遍，2026-08-13 晚）
+
+对正路(henryharris)与绕桶(grace.garcia)各做一次 Supabase login → 构建 sb-auth-auth-token
+cookie → POST /api/welcome/claim：
+
+| 账号 | 路径 | signup_proof | quarantine | claim | wallet | grant amount |
+| --- | --- | --- | --- | --- | --- | --- |
+| henryharris@star36.m0m.app | 正路 server-action | 有 | 无 | `nothing_pending` | balance_trial=0 | 0 |
+| grace.garcia@lab.only2.cyou | 绕桶 supabase | 无 | signup_origin_unverified | `nothing_pending` | balance_trial=0 | 0 |
+
+`nothing_pending` = welcome grant 已 claim 过一次（注册时 claim 返回 ok:true 但 rewardUsd:0），
+不能重复 claim。**正路账号有 proof 无 quarantine 照样 $0**，坐实「$5 与 signup_proof 无因果，
+是后端 welcome 促销金额 08-11 后从 5 改为 0」。
+
+**register.mjs note 空的原因**（此前误判为「claim 没走」）：正路用 `jar`（cookie=undefined），
+claim 返回 ok:true+rewardUsd:0 时走 else 分支（不写 note）；绕桶带 `cookie` 才进
+「balance_trial<4.99 → 写 supabase-native $0 note」分支。所以 note 空 ≠ claim 失败，
+而是「claim 成功但拿了 $0」。
