@@ -471,3 +471,39 @@ test('gateway falls back to local token estimate when count_tokens upstream stal
     await close(upstream);
   }
 });
+
+test('upstream-wide "peak demand" 502 is NOT retried: one attempt, direct relay, no key report', async () => {
+  // Measured 2026-08-13: an ok key got 502 "peak demand" from the upstream
+  // regardless of account (same key: sonnet 200 while opus/fable 502).
+  // Rotating would burn one attempt per key — relay the upstream answer and
+  // let the client retry after the window closes.
+  const attempts = [];
+  const upstream = createServer(async (req, res) => {
+    const key = req.headers['x-api-key'];
+    attempts.push(key);
+    res.writeHead(502, { 'content-type': 'application/json' });
+    return res.end(JSON.stringify({
+      type: 'error',
+      error: { type: 'api_error', message: "We're experiencing peak demand right now and couldn't complete this request. Please try again in a little while." },
+    }));
+  });
+  const upstreamOrigin = await listen(upstream);
+  const keyPool = pool(['key-one', 'key-two']);
+  const gateway = createGateway({ pool: keyPool, upstreamBase: `${upstreamOrigin}` + '/v1' });
+  const gatewayOrigin = await listen(gateway);
+  try {
+    const response = await fetch(`${gatewayOrigin}` + '/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'th-local', 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: 'claude-opus-5', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    assert.equal(response.status, 502);
+    const body = await response.json();
+    assert.match(body.error.message, /peak demand/);
+    assert.deepEqual(attempts, ['key-one'], 'must NOT rotate to a second key on upstream-wide peak demand');
+    assert.equal(keyPool.reports.length, 0, 'peak demand must not mark the key failed');
+  } finally {
+    await close(gateway);
+    await close(upstream);
+  }
+});

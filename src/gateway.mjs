@@ -118,6 +118,11 @@ function classify(status, code, message = '') {
   // per-key capacity fault, not a genuine oversized request, so it must
   // rotate to another key instead of being handed straight to the client.
   if (status === 400 && /context window|context_length/i.test(failureText)) return 'context_window';
+  // Upstream-wide peak: "peak demand" 502s hit an ok key regardless of account
+  // (measured 2026-08-13: same key 200 on sonnet while opus/fable got 502).
+  // Rotating burns a fresh attempt per key for nothing — return to the client
+  // and let it retry after the window closes.
+  if (/peak demand/i.test(failureText)) return 'peak_demand';
   if (status >= 500 || status === 0) return 'network';
   //   insufficient_quota -> daily request quota, comes back on reset, which is
   //     exactly what 'quota' already means.
@@ -215,6 +220,7 @@ function responseHeaders(upstream) {
 }
 
 function isRetryable(status, reason) {
+  if (reason === 'peak_demand') return false; // upstream-wide peak, retrying just burns keys
   return (
     reason === 'dead' ||
     reason === 'balance' ||
@@ -445,6 +451,7 @@ export function createGateway({
       }
       const reason = classify(status, code, message);
       if (!isRetryable(status, reason)) {
+        log(`${rec.file} Anthropic -> ${status} ${code} (${reason}); not retryable, returning to client`);
         res.writeHead(status, responseHeaders(upstream));
         res.end(failureBody);
         return;
@@ -622,6 +629,7 @@ export function createGateway({
       }
       const reason = classify(status, code, message);
       if (!isRetryable(status, reason)) {
+        log(`${rec.file} -> ${status} ${code} (${reason}); not retryable, returning to client`);
         res.writeHead(status, responseHeaders(upstream));
         res.end(failureBody);
         return;

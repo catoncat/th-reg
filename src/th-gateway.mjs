@@ -48,7 +48,12 @@ const pool = new Pool({
 });
 pool.setLedger(ledger, { seed: true });
 
-const log = (m) => console.log(`[gateway] ${m}`);
+const ts = () => {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+};
+const log = (m) => console.log(`[gateway] ${ts()} ${m}`);
 
 // Short-lived routing metadata only: no prompt contents are persisted.
 // The file is truncated on boot and contains project/session attribution when
