@@ -34,14 +34,20 @@ test('a flagged key leaves the rotation but keeps its money', () => {
   assert.equal(p.healthSnapshot().totalBalance, 5, 'held money is not spendable head-room');
 });
 
-test('a flagged key returns to the rotation once the cooldown passes', () => {
+test('flagged is a per-tier terminal state: no cooldown revival for restricted, still borrowable by unrestricted', () => {
   const p = mkPool(2);
   p.report('k0', hold);
   assert.equal(p.activeCount(), 1);
 
+  // Design since 2026-08-12 (model-tier layering): flagged is NOT a temporary
+  // cooldown any more — an expired flaggedAt never returns the key to the
+  // restricted rotation (claude/glm/gpt/gemini/kimi/deepseek-flash).
   p.keys.get('k0').flaggedAt = new Date(Date.now() - 31 * 60 * 1000).toISOString();
+  assert.equal(p.activeCount(), 1, 'restricted pool must not revive a flagged key after cooldown');
 
-  assert.equal(p.activeCount(), 2, 'cooldown expired: retry it rather than write it off');
+  // Unrestricted-tier models (deepseek-pro/mimo/qwen) may still borrow it.
+  assert.equal(p.activeKeys('unrestricted').length, 2);
+  assert.ok(p.activeKeys('unrestricted').some((r) => r.key === 'k0'), 'unrestricted tier may borrow flagged keys');
 });
 
 test('a flagged key is never counted as exhausted or dead', () => {
