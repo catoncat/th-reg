@@ -472,11 +472,10 @@ test('gateway falls back to local token estimate when count_tokens upstream stal
   }
 });
 
-test('upstream-wide "peak demand" 502 is NOT retried: one attempt, direct relay, no key report', async () => {
-  // Measured 2026-08-13: an ok key got 502 "peak demand" from the upstream
-  // regardless of account (same key: sonnet 200 while opus/fable 502).
-  // Rotating would burn one attempt per key — relay the upstream answer and
-  // let the client retry after the window closes.
+test('peak demand backs off and retries, then relays last upstream 502 after peakMaxRetries', async () => {
+  // Measured 2026-08-13: ANY ok key can get 502 "peak demand" from the
+  // upstream (same fixed code), in seconds-to-minutes windows. The gateway
+  // must back off and retry so a window gap succeeds, never marking keys failed.
   const attempts = [];
   const upstream = createServer(async (req, res) => {
     const key = req.headers['x-api-key'];
@@ -489,7 +488,7 @@ test('upstream-wide "peak demand" 502 is NOT retried: one attempt, direct relay,
   });
   const upstreamOrigin = await listen(upstream);
   const keyPool = pool(['key-one', 'key-two']);
-  const gateway = createGateway({ pool: keyPool, upstreamBase: `${upstreamOrigin}` + '/v1' });
+  const gateway = createGateway({ pool: keyPool, upstreamBase: `${upstreamOrigin}` + '/v1', peakBackoffMs: 1, peakMaxRetries: 1 });
   const gatewayOrigin = await listen(gateway);
   try {
     const response = await fetch(`${gatewayOrigin}` + '/v1/messages', {
@@ -500,8 +499,42 @@ test('upstream-wide "peak demand" 502 is NOT retried: one attempt, direct relay,
     assert.equal(response.status, 502);
     const body = await response.json();
     assert.match(body.error.message, /peak demand/);
-    assert.deepEqual(attempts, ['key-one'], 'must NOT rotate to a second key on upstream-wide peak demand');
+    assert.equal(attempts.length, 2, 'first attempt + peakMaxRetries backoff retries');
     assert.equal(keyPool.reports.length, 0, 'peak demand must not mark the key failed');
+  } finally {
+    await close(gateway);
+    await close(upstream);
+  }
+});
+test('peak demand recovers on retry once the upstream window gap arrives', async () => {
+  let n = 0;
+  const attempts = [];
+  const upstream = createServer(async (req, res) => {
+    const key = req.headers['x-api-key'];
+    attempts.push(key);
+    if (n++ === 0) {
+      res.writeHead(502, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'api_error', message: "We're experiencing peak demand right now..." },
+      }));
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    return res.end(JSON.stringify({ id: 'ok', content: [{ type: 'text', text: 'hi' }], usage: { input_tokens: 1, output_tokens: 1 } }));
+  });
+  const upstreamOrigin = await listen(upstream);
+  const keyPool = pool(['key-one', 'key-two']);
+  const gateway = createGateway({ pool: keyPool, upstreamBase: `${upstreamOrigin}` + '/v1', peakBackoffMs: 1, peakMaxRetries: 2 });
+  const gatewayOrigin = await listen(gateway);
+  try {
+    const response = await fetch(`${gatewayOrigin}` + '/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'th-local', 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: 'claude-opus-5', max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    assert.equal(response.status, 200, 'retry lands on the window gap');
+    assert.equal(attempts.length, 2, 'borrow again on next key after backoff');
+    assert.equal(keyPool.reports.length, 0);
   } finally {
     await close(gateway);
     await close(upstream);

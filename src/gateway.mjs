@@ -35,6 +35,12 @@ import { estimateCostUsd } from './pricing.mjs';
 const UPSTREAM = 'https://tokenharbor.ai/v1';
 const TIMEOUT = 120000; // upstream LLM calls can be slow
 const MAX_KEY_ATTEMPTS = 8; // give up after trying this many distinct keys
+// Upstream-wide high-demand window (`peak demand`): windows last seconds to
+// minutes and hit ANY account/key with the same fixed code. Back off and retry
+// instead of failing the client immediately.
+const PEAK_BACKOFF_MS = 1500;
+const PEAK_MAX_RETRIES = 3;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * A flagged account (upstream risk hold) has most models locked but can still
@@ -220,7 +226,6 @@ function responseHeaders(upstream) {
 }
 
 function isRetryable(status, reason) {
-  if (reason === 'peak_demand') return false; // upstream-wide peak, retrying just burns keys
   return (
     reason === 'dead' ||
     reason === 'balance' ||
@@ -318,6 +323,8 @@ export function createGateway({
   upstreamBase = UPSTREAM,
   timeoutMs = TIMEOUT,
   maxKeyAttempts = MAX_KEY_ATTEMPTS,
+  peakBackoffMs = PEAK_BACKOFF_MS,
+  peakMaxRetries = PEAK_MAX_RETRIES,
 }) {
   async function handleMessages(req, res, bodyBuf, endpoint = 'messages') {
     bodyBuf = injectConfirmSpend(bodyBuf);
@@ -376,6 +383,7 @@ export function createGateway({
     // not evidence of a risk-hold storm.
     const flaggedStreakLimit = 2;
     let flaggedStreak = 0;
+    let peakTries = 0;
     const tier = modelTier(model);
     for (let attempt = 0; attempt < maxKeyAttempts; attempt++) {
       const rec = pool.borrowKey(tried, attempt === 0 && !metering ? convo : null, tier);
@@ -450,6 +458,19 @@ export function createGateway({
         /* not json */
       }
       const reason = classify(status, code, message);
+      if (reason === 'peak_demand' && !metering) {
+        if (peakTries >= peakMaxRetries) {
+          log(`${rec.file} Anthropic -> ${status} ${code} (${reason}); window persists after ${peakTries} retries, returning upstream answer`);
+          res.writeHead(status, responseHeaders(upstream));
+          res.end(failureBody);
+          return;
+        }
+        peakTries++;
+        const backoffMs = peakBackoffMs * peakTries;
+        log(`${rec.file} Anthropic -> ${status} ${code} (${reason}); backing off ${backoffMs}ms (${peakTries}/${peakMaxRetries})`);
+        await sleep(backoffMs);
+        continue;
+      }
       if (!isRetryable(status, reason)) {
         log(`${rec.file} Anthropic -> ${status} ${code} (${reason}); not retryable, returning to client`);
         res.writeHead(status, responseHeaders(upstream));
@@ -558,6 +579,7 @@ export function createGateway({
     // Flagged-storm guard (see handleMessages for rationale).
     const flaggedStreakLimit = 2;
     let flaggedStreak = 0;
+    let peakTries = 0;
     const tier = modelTier(model);
     for (let attempt = 0; attempt < maxKeyAttempts; attempt++) {
       const rec = pool.borrowKey(tried, attempt === 0 ? convo : null, tier);
@@ -628,6 +650,19 @@ export function createGateway({
         /* not json */
       }
       const reason = classify(status, code, message);
+      if (reason === 'peak_demand') {
+        if (peakTries >= peakMaxRetries) {
+          log(`${rec.file} -> ${status} ${code} (${reason}); window persists after ${peakTries} retries, returning upstream answer`);
+          res.writeHead(status, responseHeaders(upstream));
+          res.end(failureBody);
+          return;
+        }
+        peakTries++;
+        const backoffMs = peakBackoffMs * peakTries;
+        log(`${rec.file} -> ${status} ${code} (${reason}); backing off ${backoffMs}ms (${peakTries}/${peakMaxRetries})`);
+        await sleep(backoffMs);
+        continue;
+      }
       if (!isRetryable(status, reason)) {
         log(`${rec.file} -> ${status} ${code} (${reason}); not retryable, returning to client`);
         res.writeHead(status, responseHeaders(upstream));
